@@ -1,0 +1,43 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local caches and temp
+cache/
+tmp/
+*.log
+*.jsonl
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+
+# Data (keep manifest + gitkeeps)
+data/raw/**
+data/external/**
+data/interim/**
+data/processed/**
+!data/raw/.gitkeep
+!data/external/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!data/manifest.md
+
+# Reports (keep audit JSON/SVG + gitkeep)
+reports/**
+!reports/audit/
+!reports/audit/.gitkeep
+!reports/audit/*.json
+!reports/audit/*.svg
+
+# External clones (optional)
+node2vec/
+baselines/HCRide/
+
+# Editor/OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

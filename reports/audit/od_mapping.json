@@ -1,0 +1,40 @@
+{
+  "files": [
+    {
+      "rows": 652839,
+      "mismatch_rate": 0.2831479124255751,
+      "barrier_impact_count": 0,
+      "pickup_barrier_impact_count": 0,
+      "dropoff_barrier_impact_count": 0,
+      "barrier_impact_rate": 0.0,
+      "pickup_barrier_impact_rate": 0.0,
+      "dropoff_barrier_impact_rate": 0.0,
+      "structural_unreachability_rate": 0.0,
+      "structural_unreachability_count": 0,
+      "pickup_structural_unreachability_rate": 0.0,
+      "dropoff_structural_unreachability_rate": 0.0,
+      "pickup_structural_unreachability_count": 0,
+      "dropoff_structural_unreachability_count": 0,
+      "input_path": "data\\processed\\nyc_bbox\\yellow_tripdata_2025-09.parquet",
+      "output_path": "data\\processed\\od_mapped\\yellow_tripdata_2025-09.parquet"
+    },
+    {
+      "rows": 701540,
+      "mismatch_rate": 0.2850927958491319,
+      "barrier_impact_count": 0,
+      "pickup_barrier_impact_count": 0,
+      "dropoff_barrier_impact_count": 0,
+      "barrier_impact_rate": 0.0,
+      "pickup_barrier_impact_rate": 0.0,
+      "dropoff_barrier_impact_rate": 0.0,
+      "structural_unreachability_rate": 0.0,
+      "structural_unreachability_count": 0,
+      "pickup_structural_unreachability_rate": 0.0,
+      "dropoff_structural_unreachability_rate": 0.0,
+      "pickup_structural_unreachability_count": 0,
+      "dropoff_structural_unreachability_count": 0,
+      "input_path": "data\\processed\\nyc_bbox\\yellow_tripdata_2025-10.parquet",
+      "output_path": "data\\processed\\od_mapped\\yellow_tripdata_2025-10.parquet"
+    }
+  ]
+}

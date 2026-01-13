@@ -1,0 +1,3 @@
+# Placeholder to keep data/processed in git.
+# Generated artifacts (parquet, embeddings, graphs) are not tracked.
+# Regenerate via scripts and record hashes in data/manifest.md.

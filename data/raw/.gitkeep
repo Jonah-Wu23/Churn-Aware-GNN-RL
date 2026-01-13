@@ -1,0 +1,3 @@
+# Placeholder to keep data/raw in git.
+# Store raw source files locally; do not commit large datasets.
+# Record sources and hashes in data/manifest.md.

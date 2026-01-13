@@ -1,0 +1,13 @@
+{
+  "graph_nodes_path": "data\\processed\\graph\\layer2_nodes.parquet",
+  "graph_edges_path": "data\\processed\\graph\\layer2_edges.parquet",
+  "output_path": "data\\processed\\graph\\node2vec_embeddings.parquet",
+  "dimensions": 32,
+  "walk_length": 40,
+  "num_walks": 200,
+  "p": 1.0,
+  "q": 1.0,
+  "weight_mode": "inverse_travel_time",
+  "seed": 7,
+  "missing_nodes": 0
+}

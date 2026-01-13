@@ -1,0 +1,3 @@
+# Placeholder to keep data/external in git.
+# External downloads (e.g., shapefiles, zone lookups) live here; do not commit binaries.
+# Record sources and hashes in data/manifest.md.
