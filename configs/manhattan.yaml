@@ -33,7 +33,7 @@ env:
   walk_threshold_sec: 600
   max_requests: 2000
   seed: 7
-  num_vehicles: 1
+  num_vehicles: 50
   vehicle_capacity: 6
   request_timeout_sec: 600
   debug_mask: true
