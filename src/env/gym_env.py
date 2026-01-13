@@ -69,6 +69,7 @@ class EnvConfig:
     reward_fairness_weight: float = 1.0
     cvar_alpha: float = 0.95
     fairness_gamma: float = 1.0
+    travel_time_multiplier: float = 1.0
     debug_mask: bool = False
     od_glob: str = "data/processed/od_mapped/*.parquet"
     graph_nodes_path: str = "data/processed/graph/layer2_nodes.parquet"
@@ -86,6 +87,8 @@ class EnvConfig:
             self.onboard_churn_tol_sec = int(self.churn_tol_sec)
         if self.onboard_churn_beta is None:
             self.onboard_churn_beta = float(self.churn_beta)
+        if self.travel_time_multiplier <= 0:
+            raise ValueError("travel_time_multiplier must be positive")
 
 
 @dataclass
@@ -94,6 +97,7 @@ class VehicleState:
     current_stop: int
     available_time: float = 0.0
     onboard: List[dict] = field(default_factory=list)
+    visit_counts: Dict[int, int] = field(default_factory=dict)
 
 
 class EventDrivenEnv:
@@ -115,7 +119,16 @@ class EventDrivenEnv:
         edges["source"] = edges["source"].astype(int)
         edges["target"] = edges["target"].astype(int)
         edges["travel_time_sec"] = edges["travel_time_sec"].astype(float)
+        if self.config.travel_time_multiplier != 1.0:
+            edges["travel_time_sec"] = edges["travel_time_sec"] * float(self.config.travel_time_multiplier)
         self.stop_ids = nodes["gnn_node_id"].astype(int).tolist()
+        if "lon" in nodes.columns and "lat" in nodes.columns:
+            self.stop_coords = {
+                int(stop_id): (float(lon), float(lat))
+                for stop_id, lon, lat in nodes[["gnn_node_id", "lon", "lat"]].itertuples(index=False, name=None)
+            }
+        else:
+            self.stop_coords = {int(stop_id): (0.0, 0.0) for stop_id in self.stop_ids}
         stop_index = {int(stop_id): idx for idx, stop_id in enumerate(self.stop_ids)}
         src_idx = edges["source"].map(stop_index).astype(int).to_numpy()
         dst_idx = edges["target"].map(stop_index).astype(int).to_numpy()
@@ -369,6 +382,7 @@ class EventDrivenEnv:
         self.structurally_unserviceable = 0
         self.service_count_by_stop = {int(stop_id): 0 for stop_id in self.stop_ids}
         self.dropoff_count_by_stop = {int(stop_id): 0 for stop_id in self.stop_ids}
+        self.acc_wait_time_by_stop = {int(stop_id): 0.0 for stop_id in self.stop_ids}
         self.canceled_requests: List[dict] = []
         self.last_mask_debug: List[dict] = []
         self._step_stats = self._init_step_stats()
@@ -429,7 +443,9 @@ class EventDrivenEnv:
         vehicle.onboard = value
 
     def _churn_prob(self, wait_sec: float, beta: float, tol_sec: float) -> float:
-        return float(1.0 / (1.0 + np.exp(-beta * (wait_sec - tol_sec))))
+        x = float(beta * (wait_sec - tol_sec))
+        x = float(np.clip(x, -60.0, 60.0))
+        return float(1.0 / (1.0 + np.exp(-x)))
 
     def _waiting_churn_prob(self, wait_sec: float) -> float:
         return self._churn_prob(
@@ -606,6 +622,9 @@ class EventDrivenEnv:
     def _handle_vehicle_arrival(
         self, vehicle: VehicleState
     ) -> Tuple[int, float, float, float, float, List[int]]:
+        vehicle.visit_counts[int(vehicle.current_stop)] = (
+            vehicle.visit_counts.get(int(vehicle.current_stop), 0) + 1
+        )
         dropped = [p for p in vehicle.onboard if p["dropoff_stop_id"] == vehicle.current_stop]
         kept = [p for p in vehicle.onboard if p["dropoff_stop_id"] != vehicle.current_stop]
         vehicle.onboard = kept
@@ -639,6 +658,8 @@ class EventDrivenEnv:
             )
             self._transition(req, "onboard", reason="boarded")
             vehicle.onboard.append(req)
+            wait_sec = max(0.0, float(self.current_time) - float(req["request_time_sec"]))
+            self.acc_wait_time_by_stop[int(vehicle.current_stop)] += wait_sec
         if boarded:
             self.service_count_by_stop[int(vehicle.current_stop)] += len(boarded)
 
@@ -646,6 +667,7 @@ class EventDrivenEnv:
 
     def _prepare_initial_arrivals(self) -> None:
         for vehicle in self.vehicles:
+            vehicle.visit_counts = {int(vehicle.current_stop): 1}
             self._schedule_event(
                 0.0,
                 EVENT_VEHICLE_ARRIVAL,
@@ -955,15 +977,26 @@ class EventDrivenEnv:
         self.steps += 1
         self._advance_until_ready()
 
+        reward_base_service = self.config.reward_service * self._step_stats["served"]
+        reward_waiting_churn = self.config.reward_waiting_churn_penalty * self._step_stats["waiting_churn_prob_sum"]
+        reward_fairness = (
+            self.config.reward_fairness_weight * self._step_stats["waiting_churn_prob_weighted_sum"]
+        )
+        reward_cvar = self.config.reward_cvar_penalty * self._step_stats["waiting_churn_cvar"]
+        reward_travel_cost = self.config.reward_travel_cost_per_sec * travel_time
+        reward_onboard_delay = self.config.reward_onboard_delay_weight * self._step_stats["onboard_delay_prob_sum"]
+        reward_onboard_churn = self.config.reward_onboard_churn_penalty * self._step_stats["onboard_churn_prob_sum"]
+        reward_tacc = self.config.reward_tacc_weight * self._step_stats["tacc_gain"]
+
         reward = (
-            self.config.reward_service * self._step_stats["served"]
-            - self.config.reward_waiting_churn_penalty * self._step_stats["waiting_churn_prob_sum"]
-            - self.config.reward_fairness_weight * self._step_stats["waiting_churn_prob_weighted_sum"]
-            - self.config.reward_cvar_penalty * self._step_stats["waiting_churn_cvar"]
-            - self.config.reward_travel_cost_per_sec * travel_time
-            - self.config.reward_onboard_delay_weight * self._step_stats["onboard_delay_prob_sum"]
-            - self.config.reward_onboard_churn_penalty * self._step_stats["onboard_churn_prob_sum"]
-            + self.config.reward_tacc_weight * self._step_stats["tacc_gain"]
+            reward_base_service
+            - reward_waiting_churn
+            - reward_fairness
+            - reward_cvar
+            - reward_travel_cost
+            - reward_onboard_delay
+            - reward_onboard_churn
+            + reward_tacc
         )
         if self.steps >= self.config.max_horizon_steps:
             self.done = True
@@ -987,6 +1020,16 @@ class EventDrivenEnv:
             "step_tacc_gain": float(self._step_stats["tacc_gain"]),
             "step_boarded": float(self._step_stats["boarded"]),
             "step_denied_boarding": float(self._step_stats["denied_boarding"]),
+            "step_travel_time_sec": float(travel_time),
+            "reward_base_service": float(reward_base_service),
+            "reward_waiting_churn_penalty": float(reward_waiting_churn),
+            "reward_fairness_penalty": float(reward_fairness),
+            "reward_cvar_penalty": float(reward_cvar),
+            "reward_travel_cost": float(reward_travel_cost),
+            "reward_onboard_delay_penalty": float(reward_onboard_delay),
+            "reward_onboard_churn_penalty": float(reward_onboard_churn),
+            "reward_tacc_bonus": float(reward_tacc),
+            "reward_total": float(reward),
         }
         if self.done:
             info["event_trace_digest"] = self._event_trace_digest()

@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-01-12T14:28:42.127582+00:00",
+  "generated_at": "2026-01-13T07:49:05.466473+00:00",
   "output_dir": "data\\processed\\graph",
   "node_count": 559,
   "edge_count": 16770,
@@ -25,13 +25,42 @@
   },
   "travel_time_sec": {
     "min": 1.0,
-    "p50": 49.288279948363055,
-    "p95": 94.32756219915474,
-    "mean": 51.96665015325089,
+    "p50": 49.29112048900142,
+    "p95": 94.34200163514475,
+    "mean": 51.983511443858355,
     "max": 316.92527511553584
   },
   "visualization_path": "reports\\audit\\graph_build.svg",
   "build_params": {
-    "source": "audit_graph"
+    "place_name": "Manhattan, New York, USA",
+    "bbox": {
+      "north": 40.77034,
+      "south": 40.74271,
+      "east": -73.91722,
+      "west": -73.99532
+    },
+    "cutoff_sec": 1200,
+    "neighbor_k": 30,
+    "fallback_speed_mps": 11.17597222222222,
+    "fallback_counts": {
+      "directed_full": 0,
+      "undirected_cutoff": 3,
+      "undirected_full": 0,
+      "haversine": 0
+    },
+    "min_travel_time_sec": 1.0,
+    "zero_travel_time_fix": {
+      "zero_travel_time_edges": 454,
+      "fixed_with_coords": 454,
+      "fixed_with_min": 0
+    },
+    "prune_zero_in": true,
+    "prune_zero_out": true,
+    "prune_stats": {
+      "pruned_nodes": 2,
+      "pruned_zero_in": 2,
+      "pruned_zero_out": 0,
+      "prune_rounds": 1
+    }
   }
 }

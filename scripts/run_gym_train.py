@@ -58,6 +58,7 @@ def main():
             reward_fairness_weight=float(env_cfg.get("reward_fairness_weight", 1.0)),
             cvar_alpha=float(env_cfg.get("cvar_alpha", 0.95)),
             fairness_gamma=float(env_cfg.get("fairness_gamma", 1.0)),
+            travel_time_multiplier=float(env_cfg.get("travel_time_multiplier", 1.0)),
             debug_mask=bool(env_cfg.get("debug_mask", False)),
             od_glob=env_cfg.get("od_glob", "data/processed/od_mapped/*.parquet"),
             graph_nodes_path=env_cfg.get("graph_nodes_path", "data/processed/graph/layer2_nodes.parquet"),

@@ -141,9 +141,9 @@
 ---
 
 # H. Reward + North Star Metric (TACC) - Doc Alignment
-- [ ] Implement reward terms exactly as described in the doc.
+- [x] Implement reward terms exactly as described in the doc.
   - Acceptance: includes base service reward, travel cost, churn probability penalty, onboard delay penalty, CVaR penalty, fairness weighting, and TACC weighting.
-  - Acceptance: each term logged separately; config controls weights.
+  - Acceptance: each term logged separately; config controls weights; logged in `src/env/gym_env.py` step info and `reward_terms.jsonl` from training runs.
 - [x] Implement TACC ("Total Avoided Private Car Travel Time") as the north-star metric.
   - Acceptance: TACC computed and accumulated.
   - Acceptance: definition is documented and consistent with OD data source/proxy (explicit formula + units).
@@ -151,30 +151,39 @@
 ---
 
 # I. Curriculum Learning (Structured Curriculum) - L0-L3 (+ L4 Stress)
-- [ ] Implement structured scenario generator for curriculum phases.
-  - Acceptance: L0-L3 match the doc; optional L4 stress; each phase changes OD spatial density/pressure exactly as described.
-- [ ] Implement "stuckness" as constraint saturation.
-  - Acceptance: stuckness computed as masked-action ratio per step/episode; logged.
-- [ ] Implement trigger signal `rho = service_rate / (1 + gamma * stuckness)`.
-  - Acceptance: rho computed and used to advance curriculum; transitions are logged with thresholds.
-- [ ] Implement specific "bait" and "surge" stress tests.
-  - Acceptance: scenarios reproduce center-short-trip bait vs edge-long-trip scarcity; surge overload; evaluator outputs metrics.
+- [x] Implement structured scenario generator for curriculum phases.
+  - Acceptance: L0-L3 match the doc; optional L4 stress; each phase changes OD spatial density/pressure exactly as described; stage OD + audit JSON emitted per stage via `src/train/curriculum.py`.
+- [x] Implement "stuckness" as constraint saturation.
+  - Acceptance: stuckness computed as masked-action ratio per step/episode; logged in `reward_terms.jsonl` (step) and `train_log.jsonl` (episode).
+- [x] Implement trigger signal `rho = service_rate / (1 + gamma * stuckness)`.
+  - Acceptance: rho computed and used to advance curriculum; transitions are logged with thresholds in `curriculum_log.jsonl`.
+- [x] Implement specific "bait" and "surge" stress tests.
+  - Acceptance: scenarios reproduce center-short-trip bait vs edge-long-trip scarcity; surge overload; evaluator outputs metrics to `stress_metrics.json` + `stress_metrics.csv`.
 
 ---
 
 # J. Evaluation + Baselines - Comparable and Paper-Ready
-- [ ] Implement a unified evaluator producing paper metrics (same code path for all policies).
+- [x] Implement a unified evaluator producing paper metrics (same code path for all policies).
   - Acceptance: metrics include:
-    - System Churn Rate (explicit split waiting vs onboard, plus algorithmic vs structural)
-    - TACC
-    - 95th percentile wait time
-    - Fairness (Gini of stop service rate)
-  - Acceptance: reproducible across seeds; outputs saved with config + seed + dataset hashes.
-- [ ] Implement baseline policies from doc.
-  - Acceptance: `Greedy`, `Insertion Heuristic`, `Standard RL` (DQN optimizing total wait time; no churn/CVaR/edge features).
-  - Acceptance: all baselines run end-to-end in the same evaluator and produce identical metric schema.
+    - System Churn Rate (explicit split waiting vs onboard, plus algorithmic vs structural) via `src/eval/evaluator.py`.
+    - TACC via `tacc_total` in `eval_results.json`.
+    - 95th percentile wait time via `wait_time_p95_sec`.
+    - Fairness (Gini of stop service rate) via `service_gini`.
+  - Acceptance: reproducible across seeds; outputs saved with config + seed + dataset hashes in `eval_results.json` (plus `eval_episodes.csv`).
 - [ ] Implement HCRide baseline.
   - Acceptance: matches referenced HCRide rule/parameters; documented (English) with citations in `docs/` or `src/eval/README.md`.
+  - Acceptance: produces evaluator metrics.
+- [ ] Implement MAPPO baseline.
+  - Acceptance: matches upstream MAPPO implementation/params (baselines/on-policy); documented (English) with citations in `docs/` or `src/eval/README.md`.
+  - Acceptance: produces evaluator metrics.
+- [ ] Implement safety-starter-agents baseline (CPO).
+  - Acceptance: matches upstream CPO implementation/params (safety-starter-agents); documented (English) with citations in `docs/` or `src/eval/README.md`.
+  - Acceptance: produces evaluator metrics.
+- [ ] Implement MOHITO (UAI 2025) baseline.
+  - Acceptance: matches upstream MOHITO implementation/params (baselines/mohito-public, PettingZoo env integration); documented (English) with citations in `docs/` or `src/eval/README.md`.
+  - Acceptance: produces evaluator metrics.
+- [ ] Implement Wu et al. (C&IE 2024) multi-agent microtransit baseline.
+  - Acceptance: matches upstream implementation/params (baselines/transportation_sparse/Multi-Agent Deep Reinforcement Learning based Real-time Planning Approach for Responsive Customized Bus Routes); documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
 - [ ] Ensure fairness metric definition is explicit and reproducible.
   - Acceptance: define "stop service rate" denominator and stop set.

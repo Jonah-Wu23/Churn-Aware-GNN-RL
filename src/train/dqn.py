@@ -6,11 +6,12 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import numpy as np
 import torch
 from torch import nn
+import copy
 from torch.nn import functional as F
 
 from src.train.replay_buffer import BufferSpec, ReplayBuffer
@@ -63,9 +64,8 @@ class DQNTrainer:
         self.device = torch.device(config.device)
 
         self.model.to(self.device)
-        self.target_model = type(model)(**model.__dict__["_modules"] and {})  # placeholder
         # Re-create target model by deepcopy to preserve architecture.
-        self.target_model = torch.nn.utils.parametrize.clone_module(model)
+        self.target_model = copy.deepcopy(model)
         self.target_model.to(self.device)
         self.target_model.load_state_dict(model.state_dict())
         self.target_model.eval()
@@ -90,6 +90,8 @@ class DQNTrainer:
         self.log_path = run_dir / "train_log.jsonl"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._log_handle = self.log_path.open("w", encoding="utf-8")
+        self.reward_log_path = run_dir / "reward_terms.jsonl"
+        self._reward_log_handle = self.reward_log_path.open("w", encoding="utf-8")
 
         meta = {
             "seed": int(config.seed),
@@ -97,12 +99,17 @@ class DQNTrainer:
             "graph_hashes": graph_hashes,
             "od_hashes": od_hashes,
         }
-        self._log_handle.write(json.dumps({"type": "meta", "payload": meta}, ensure_ascii=False) + "\n")
+        meta_record = json.dumps({"type": "meta", "payload": meta}, ensure_ascii=False) + "\n"
+        self._log_handle.write(meta_record)
+        self._reward_log_handle.write(meta_record)
         self._log_handle.flush()
+        self._reward_log_handle.flush()
 
     def close(self) -> None:
         if getattr(self, "_log_handle", None):
             self._log_handle.close()
+        if getattr(self, "_reward_log_handle", None):
+            self._reward_log_handle.close()
 
     def _q_values(self, obs: np.ndarray, obs_idx: int, action_nodes: np.ndarray, action_edge: np.ndarray) -> torch.Tensor:
         x = torch.tensor(obs, dtype=torch.float32, device=self.device)
@@ -236,51 +243,97 @@ class DQNTrainer:
 
         return {"loss": float(np.mean(losses)) if losses else 0.0}
 
-    def train(self) -> Path:
+    def train(
+        self,
+        total_steps: Optional[int] = None,
+        episode_callback: Optional[Callable[[Dict[str, float]], bool]] = None,
+    ) -> Path:
         cfg = self.config
+        max_steps = int(total_steps if total_steps is not None else cfg.total_steps)
         episode_return = 0.0
         episode_steps = 0
         stuck_sum = 0.0
+        episode_index = 0
 
         self.env.reset()
-        for step in range(1, int(cfg.total_steps) + 1):
+        try:
+            from tqdm import tqdm
+        except ImportError:  # pragma: no cover
+            tqdm = None
+
+        iterator = range(1, max_steps + 1)
+        if tqdm is not None:
+            iterator = tqdm(iterator, total=max_steps, desc="train", unit="step")
+
+        for step in iterator:
             eps = _linear_schedule(cfg.epsilon_start, cfg.epsilon_end, cfg.epsilon_decay_steps, step)
             features = self.env.get_feature_batch()
             mask = features["action_mask"].astype(bool)
-            stuck_sum += float((~mask).mean()) if len(mask) else 1.0
+            step_stuckness = float((~mask).mean()) if len(mask) else 1.0
+            stuck_sum += step_stuckness
             action = self._select_action(features, epsilon=eps)
+            stepped = True
             if action is None:
-                _, _, done, info = self.env.step(int(features["actions"][0])) if len(features["actions"]) else (None, 0.0, True, {})
-                done = True
+                actions = features["actions"].astype(np.int64)
+                valid = np.where(mask)[0]
+                if len(actions) == 0 or len(valid) == 0:
+                    reward = 0.0
+                    done = True
+                    info = {}
+                    stepped = False
+                else:
+                    action = int(actions[int(valid[0])])
+                    _, reward, done, info = self.env.step(int(action))
             else:
                 _, reward, done, info = self.env.step(int(action))
+
+            reward_payload = {
+                "type": "reward_terms",
+                "step": int(step),
+                "episode_index": int(episode_index),
+                "reward_total": float(info.get("reward_total", reward)),
+                "reward_base_service": float(info.get("reward_base_service", 0.0)),
+                "reward_waiting_churn_penalty": float(info.get("reward_waiting_churn_penalty", 0.0)),
+                "reward_fairness_penalty": float(info.get("reward_fairness_penalty", 0.0)),
+                "reward_cvar_penalty": float(info.get("reward_cvar_penalty", 0.0)),
+                "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
+                "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
+                "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
+                "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
+                "step_travel_time_sec": float(info.get("step_travel_time_sec", 0.0)),
+                "step_stuckness": float(step_stuckness),
+            }
+            self._reward_log_handle.write(json.dumps(reward_payload, ensure_ascii=False) + "\n")
+            if step % int(cfg.log_every_steps) == 0:
+                self._reward_log_handle.flush()
 
             episode_return += float(reward)
             episode_steps += 1
 
-            next_features = self.env.get_feature_batch()
+            next_features = self.env.get_feature_batch() if stepped else features
 
-            actions = features["actions"].astype(np.int64)
-            action_taken_idx = int(np.where(actions == int(action))[0][0]) if action is not None else 0
-            transition = {
-                "obs": features["node_features"],
-                "obs_idx": int(features["current_node_index"][0]),
-                "action_node_indices": features["action_node_indices"].astype(np.int64),
-                "action_edge_features": features["edge_features"],
-                "action_mask": features["action_mask"].astype(bool),
-                "action_count": int(len(actions)),
-                "action_taken": int(action_taken_idx),
-                "reward": float(reward),
-                "done": bool(done),
-                "next_obs": next_features["node_features"],
-                "next_obs_idx": int(next_features["current_node_index"][0]),
-                "next_action_node_indices": next_features["action_node_indices"].astype(np.int64),
-                "next_action_edge_features": next_features["edge_features"],
-                "next_action_mask": next_features["action_mask"].astype(bool),
-                "next_action_count": int(len(next_features["actions"])),
-            }
-            if int(cfg.buffer_size) > 0:
-                self.buffer.add(transition)
+            if stepped:
+                actions = features["actions"].astype(np.int64)
+                action_taken_idx = int(np.where(actions == int(action))[0][0]) if action is not None else 0
+                transition = {
+                    "obs": features["node_features"],
+                    "obs_idx": int(features["current_node_index"][0]),
+                    "action_node_indices": features["action_node_indices"].astype(np.int64),
+                    "action_edge_features": features["edge_features"],
+                    "action_mask": features["action_mask"].astype(bool),
+                    "action_count": int(len(actions)),
+                    "action_taken": int(action_taken_idx),
+                    "reward": float(reward),
+                    "done": bool(done),
+                    "next_obs": next_features["node_features"],
+                    "next_obs_idx": int(next_features["current_node_index"][0]),
+                    "next_action_node_indices": next_features["action_node_indices"].astype(np.int64),
+                    "next_action_edge_features": next_features["edge_features"],
+                    "next_action_mask": next_features["action_mask"].astype(bool),
+                    "next_action_count": int(len(next_features["actions"])),
+                }
+                if int(cfg.buffer_size) > 0:
+                    self.buffer.add(transition)
 
             train_stats = self._optimize(global_step=step)
 
@@ -303,16 +356,24 @@ class DQNTrainer:
                 }
                 self._log_handle.write(json.dumps(log, ensure_ascii=False) + "\n")
                 self._log_handle.flush()
+                stop = False
+                if episode_callback is not None:
+                    stop = bool(episode_callback(log))
                 episode_return = 0.0
                 episode_steps = 0
                 stuck_sum = 0.0
+                episode_index += 1
                 self.env.reset()
+                if stop:
+                    break
 
             if step % int(cfg.log_every_steps) == 0:
                 payload = {"type": "train", "step": int(step), "epsilon": float(eps), **train_stats}
                 self._log_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 self._log_handle.flush()
                 LOG.info("step=%d eps=%.3f %s", step, eps, train_stats)
+                if tqdm is not None:
+                    iterator.set_postfix(loss=train_stats.get("loss", 0.0), eps=round(eps, 3))
 
         return self.log_path
 

@@ -34,7 +34,7 @@ reports/**
 
 # External clones (optional)
 node2vec/
-baselines/HCRide/
+baselines
 
 # Editor/OS
 .vscode/

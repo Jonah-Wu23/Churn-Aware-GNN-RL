@@ -22,9 +22,40 @@ risk:
   cvar_alpha: 0.95
   fairness_gamma: 0.1
 
+eval:
+  episodes: 5
+  seed: 7
+  policy: random
+  device: cpu
+  max_steps: null
+
 curriculum:
   stages: [L0, L1, L2, L3]
   trigger_rho: 0.8
+  gamma: 1.0
+  stage_max_steps: 50000
+  stage_min_episodes: 3
+  stage_params:
+    L0:
+      sample_fraction: 0.1
+      time_scale: 2.0
+      churn_tol_override_sec: 1000000000
+    L1:
+      density_multiplier: 1.2
+      time_scale: 0.6
+      center_quantile: 0.3
+      short_trip_quantile: 0.3
+    L2:
+      density_multiplier: 1.2
+      time_scale: 0.7
+      center_ratio: 0.8
+      center_quantile: 0.3
+      short_trip_quantile: 0.3
+      edge_quantile: 0.7
+      long_trip_quantile: 0.7
+    L3:
+      density_multiplier: 1.0
+      time_scale: 1.0
 
 paths:
   data_dir: data
