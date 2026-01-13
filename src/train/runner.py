@@ -16,7 +16,7 @@ import torch
 from src.env.gym_env import EnvConfig, EventDrivenEnv
 from src.models.edge_q_gnn import EdgeQGNN
 from src.train.curriculum import StageSpec, default_stages, generate_stage, load_nodes, load_od_frames, stress_stages
-from src.train.dqn import DQNConfig, DQNTrainer, build_hashes
+from src.train.dqn import DQNConfig, DQNTrainer, build_hashes, write_run_meta
 from src.utils.config import load_config
 
 LOG = logging.getLogger(__name__)
@@ -181,6 +181,7 @@ def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = N
         epsilon_end=float(train_cfg.get("epsilon_end", 0.05)),
         epsilon_decay_steps=int(train_cfg.get("epsilon_decay_steps", 100_000)),
         log_every_steps=int(train_cfg.get("log_every_steps", 1_000)),
+        checkpoint_every_steps=int(train_cfg.get("checkpoint_every_steps", 10_000)),
         device=str(train_cfg.get("device", "cpu")),
     )
 
@@ -241,6 +242,12 @@ def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = N
 
         trainer.train(total_steps=int(curriculum.stage_max_steps), episode_callback=_on_episode_end)
         trainer.close()
+        write_run_meta(
+            run_dir,
+            model_path_final=(stage_dir / "edgeq_model_final.pt") if (stage_dir / "edgeq_model_final.pt").exists() else None,
+            model_path_latest=(stage_dir / "edgeq_model_latest.pt") if (stage_dir / "edgeq_model_latest.pt").exists() else None,
+            extra={"stage": spec.name, "stage_dir": str(stage_dir)},
+        )
         transition = {
             "type": "stage_transition",
             "from_stage": spec.name,

@@ -27,7 +27,25 @@
 - Framework: pytest.
 - Test files should follow `tests/test_*.py` naming.
 - Minimum coverage focus: schema validation, graph connectivity, mask compliance, reward logic.
-- Run tests locally with `pytest` before proposing changes to training or evaluation logic.
+
+### Recommended Test Commands
+Core repo tests are isolated from baseline dependencies via `pytest.ini` configuration.
+
+```bash
+# Run all core tests (recommended - uses pytest.ini defaults)
+pytest -q tests
+
+# Run with verbose output for debugging
+pytest -v tests
+
+# Run a specific test file
+pytest tests/test_churn_game.py
+
+# Run tests matching a pattern
+pytest -k "churn" tests
+```
+
+**Important**: The `baselines/` directory contains third-party reference implementations with their own dependencies. These are excluded from test discovery by default. To run baseline-specific tests, set up each baseline's environment separately per its own README.
 
 ## Commit and Pull Request Guidelines
 - No Git history is present in this repository; no established commit message convention is detectable.

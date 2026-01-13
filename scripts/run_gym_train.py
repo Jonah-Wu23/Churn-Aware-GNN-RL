@@ -1,4 +1,4 @@
-"""CLI entrypoint for Gym training."""
+"""Diagnostic baseline CLI entrypoint for Gym training (not paper-aligned)."""
 
 from __future__ import annotations
 
@@ -27,6 +27,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+    logging.basicConfig(level=logging.INFO)
+    logging.warning(
+        "DIAGNOSTIC BASELINE ONLY: This script is not paper-aligned. It does NOT use DQNTrainer, "
+        "curriculum learning, or the full Layer-2 graph message passing. It uses a star-edge-only "
+        "edge_index from the current stop and is meant for quick smoke checks."
+    )
     cfg = load_config(args.config)
     env_cfg = cfg.get("env", {})
     env = EventDrivenEnv(
@@ -70,7 +76,6 @@ def main():
         )
     )
 
-    logging.basicConfig(level=logging.INFO)
     obs = env.reset()
     features = env.get_feature_batch()
     logging.info(

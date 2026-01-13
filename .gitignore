@@ -34,10 +34,12 @@ reports/**
 
 # External clones (optional)
 node2vec/
-baselines
+baselines/
 
 # Editor/OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+如何运行.md

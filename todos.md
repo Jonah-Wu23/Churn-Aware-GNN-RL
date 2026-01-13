@@ -191,6 +191,50 @@
 
 ---
 
+# K. Doc vs Implementation Drift (v5 merged doc) - Fix Inconsistencies End-to-End
+Goal: align runnable entrypoints with `docs/流失驱动的社区微公交动态调度架构设计_合并版.md` so a user can reproduce "Stage 1 (Gym) training -> Stage 1 eval -> Stage 2 (SUMO) validation" without touching baselines.
+
+## K1. Provide a single "new system" run path (no baselines)
+- [x] Add a dedicated CLI that runs "our new thing" end-to-end (train + eval) without importing any baseline code.
+  - Step 1: add `scripts/run_edgeq_train.py` that trains via `DQNTrainer` (optionally curriculum stages).
+  - Step 2: add `scripts/run_edgeq_eval.py` that evaluates `policy=edgeq` by loading the trained model artifact.
+  - Acceptance: both scripts work with `configs/manhattan.yaml` only; no additional required flags except `--config` and `--run-dir`.
+  - Acceptance: evaluator produces `reports/eval/.../eval_results.json` including hashes + metrics.
+
+## K2. Make Stage-1 training match the Edge-Q ECC design (global graph + action edges)
+- [x] Deprecate `scripts/run_gym_train.py` as "diagnostic only" and ensure it cannot be confused with the paper-aligned training.
+  - [x] Step 1: rename its log banner to "diagnostic baseline" and document limitations.
+  - [x] Step 2: ensure the paper-aligned training path always uses:
+    - `graph_edge_index` + `graph_edge_features` for message passing, and
+    - `action_edge_index` + `edge_features` for candidate actions (current-stop -> candidate-stop).
+  - [x] Acceptance: training loop never falls back to "star-edge-only message passing".
+  - [x] Acceptance: add a small unit/integration test that asserts the training data dict includes `graph_edge_index` for forward passes.
+
+## K3. Ensure training produces loadable model artifacts for `policy=edgeq`
+- [x] Persist trained policy checkpoints (for evaluator consumption).
+  - Done: DQNTrainer writes `edgeq_model_latest.pt`/`edgeq_model_final.pt` plus `checkpoint_*.pt` into the run directory.
+  - Acceptance: `src/eval/evaluator.py` can load `eval.model_path` and run `policy=edgeq` without code changes.
+- [x] Make model artifact path discoverable without manual copy-paste.
+  - [x] Step 1: emit a machine-readable `run_meta.json` in the run dir with `model_path_final`/`model_path_latest`.
+  - [x] Step 2: allow `scripts/run_eval.py` to accept `--model-path` overriding YAML config.
+  - [x] Acceptance: user can run eval immediately after training without editing YAML.
+- [x] Wire Stage-2 validation to consume the Stage-1 trained policy.
+  - Step 1: define the interface: how SUMO step provides observations and how policy emits stop decisions.
+  - Step 2: implement a minimal-but-complete TraCI loop that:
+    - loads the same Layer-2 stop graph and travel-time priors,
+    - replaces travel time with TraCI-measured dynamics,
+    - logs identical metric schema as Stage 1 evaluator (plus sim-to-real deltas).
+  - Acceptance: `python scripts/run_sumo_eval.py --config ... --model-path ...` runs and writes outputs under `reports/sumo_eval/...`.
+  - Implementation: `src/sim_sumo/sumo_env.py`, `src/sim_sumo/traci_adapter.py`, `src/sim_sumo/sumo_evaluator.py`
+
+## K5. Make tests runnable without baseline dependencies
+- [x] Prevent baseline folders from breaking `pytest` in the core repo.
+  - Step 1: restrict test discovery to `tests/` (or add `--ignore baselines` in config).
+  - Step 2: document the recommended commands: `pytest -q tests` for core checks.
+  - Acceptance: `pytest -q tests` passes on a clean environment without extra baseline deps.
+
+---
+
 # Required Tests (Do Not Skip)
 - [x] Unit tests for churn sigmoid shape (waiting + onboard) with deterministic RNG.
 - [x] Unit tests for CVaR (`cvar_alpha=0.95`) with known distributions.

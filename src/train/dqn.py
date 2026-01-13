@@ -20,6 +20,23 @@ from src.utils.hashing import sha256_file
 LOG = logging.getLogger(__name__)
 
 
+def write_run_meta(
+    run_dir: Path,
+    model_path_final: Optional[Path],
+    model_path_latest: Optional[Path],
+    extra: Optional[Dict[str, object]] = None,
+) -> Path:
+    payload: Dict[str, object] = {
+        "model_path_final": str(model_path_final) if model_path_final is not None else None,
+        "model_path_latest": str(model_path_latest) if model_path_latest is not None else None,
+    }
+    if extra:
+        payload.update(extra)
+    output_path = run_dir / "run_meta.json"
+    output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="ascii")
+    return output_path
+
+
 @dataclass(frozen=True)
 class DQNConfig:
     seed: int = 7
@@ -38,6 +55,7 @@ class DQNConfig:
     epsilon_end: float = 0.05
     epsilon_decay_steps: int = 100_000
     log_every_steps: int = 1_000
+    checkpoint_every_steps: int = 10_000
     device: str = "cpu"
 
 
@@ -62,6 +80,8 @@ class DQNTrainer:
         self.model = model
         self.config = config
         self.device = torch.device(config.device)
+        self.graph_hashes = graph_hashes
+        self.od_hashes = od_hashes
 
         self.model.to(self.device)
         # Re-create target model by deepcopy to preserve architecture.
@@ -85,6 +105,12 @@ class DQNTrainer:
 
         self.graph_edge_index = torch.tensor(env.graph_edge_index, dtype=torch.long, device=self.device)
         self.graph_edge_features = torch.tensor(env.graph_edge_features, dtype=torch.float32, device=self.device)
+        if self.graph_edge_index.numel() == 0:
+            raise ValueError("graph_edge_index is empty; training must use the full Layer-2 graph.")
+        if self.graph_edge_features.numel() == 0:
+            raise ValueError("graph_edge_features is empty; training must use the full Layer-2 graph.")
+        if self.graph_edge_index.shape[1] != self.graph_edge_features.shape[0]:
+            raise ValueError("graph_edge_index and graph_edge_features size mismatch.")
 
         self.run_dir = run_dir
         self.log_path = run_dir / "train_log.jsonl"
@@ -110,6 +136,103 @@ class DQNTrainer:
             self._log_handle.close()
         if getattr(self, "_reward_log_handle", None):
             self._reward_log_handle.close()
+
+    def _save_model(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), path)
+        self._write_run_meta()
+
+    def _save_checkpoint(self, path: Path, step: int, episode_index: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "step": int(step),
+            "episode_index": int(episode_index),
+            "config": json.loads(json.dumps(self.config.__dict__)),
+            "model_state_dict": self.model.state_dict(),
+            "target_model_state_dict": self.target_model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+        torch.save(payload, path)
+
+    def _write_run_meta(self) -> None:
+        latest_path = self.run_dir / "edgeq_model_latest.pt"
+        final_path = self.run_dir / "edgeq_model_final.pt"
+        meta = {
+            "seed": int(self.config.seed),
+            "graph_hashes": self.graph_hashes,
+            "od_hashes": self.od_hashes,
+        }
+        write_run_meta(
+            self.run_dir,
+            model_path_final=final_path if final_path.exists() else None,
+            model_path_latest=latest_path if latest_path.exists() else None,
+            extra=meta,
+        )
+
+    def _q_values_batch(self, obs: np.ndarray, obs_idx: np.ndarray, action_nodes: np.ndarray, action_edge: np.ndarray, action_counts: np.ndarray) -> list[torch.Tensor]:
+        """批量计算Q值，返回每个样本的Q值tensor列表。"""
+        batch_size = len(obs)
+        q_values_list = []
+
+        total_actions = int(action_counts.sum())
+        if total_actions == 0:
+            return [torch.tensor([], device=self.device) for _ in range(batch_size)]
+
+        num_nodes = obs.shape[1]
+        x_list = []
+        graph_edge_index_list = []
+        graph_edge_attr_list = []
+        src_list = []
+        dst_list = []
+        edge_list = []
+        
+        for i in range(batch_size):
+            count = int(action_counts[i])
+            if count > 0:
+                node_offset = i * num_nodes
+                x_list.append(torch.tensor(obs[i], dtype=torch.float32, device=self.device))
+                
+                graph_ei = self.graph_edge_index.clone()
+                graph_ei = graph_ei + node_offset
+                graph_edge_index_list.append(graph_ei)
+                graph_edge_attr_list.append(self.graph_edge_features)
+                
+                src_list.extend([int(obs_idx[i]) + node_offset] * count)
+                dst_list.extend([int(action_nodes[i, j]) + node_offset for j in range(count)])
+                edge_list.extend(action_edge[i, :count].tolist())
+
+        if len(x_list) == 0:
+            return [torch.tensor([], device=self.device) for _ in range(batch_size)]
+
+        x = torch.cat(x_list, dim=0)
+        graph_edge_index = torch.cat(graph_edge_index_list, dim=1)
+        graph_edge_attr = torch.cat(graph_edge_attr_list, dim=0)
+        src = torch.tensor(src_list, dtype=torch.long, device=self.device)
+        dst = torch.tensor(dst_list, dtype=torch.long, device=self.device)
+        action_edge_index = torch.stack([src, dst], dim=0)
+        edge_attr = torch.tensor(edge_list, dtype=torch.float32, device=self.device)
+
+        data = {
+            "node_features": x,
+            "graph_edge_index": graph_edge_index,
+            "graph_edge_features": graph_edge_attr,
+            "action_edge_index": action_edge_index,
+            "edge_features": edge_attr,
+        }
+
+        with torch.no_grad():
+            q_all = self.model(data).detach()
+
+        offset = 0
+        for i in range(batch_size):
+            count = int(action_counts[i])
+            if count > 0:
+                q_values_list.append(q_all[offset:offset + count])
+                offset += count
+            else:
+                q_values_list.append(torch.tensor([], device=self.device))
+
+        return q_values_list
 
     def _q_values(self, obs: np.ndarray, obs_idx: int, action_nodes: np.ndarray, action_edge: np.ndarray) -> torch.Tensor:
         x = torch.tensor(obs, dtype=torch.float32, device=self.device)
@@ -181,15 +304,18 @@ class DQNTrainer:
 
             q_pred = []
             q_next = []
+
+            q_pred_list = self._q_values_batch(obs, obs_idx, action_nodes, action_edge, action_count)
             for i in range(len(obs)):
                 a_count = int(action_count[i])
-                n_count = int(next_action_count[i])
                 if a_count == 0:
                     q_pred.append(torch.tensor(0.0, device=self.device))
                 else:
-                    q_values = self._q_values(obs[i], int(obs_idx[i]), action_nodes[i, :a_count], action_edge[i, :a_count])
-                    q_pred.append(q_values[int(action_taken[i])])
+                    q_pred.append(q_pred_list[i][int(action_taken[i])])
 
+            q_next_list = self._q_values_batch(next_obs, next_obs_idx, next_action_nodes, next_action_edge, next_action_count)
+            for i in range(len(obs)):
+                n_count = int(next_action_count[i])
                 if n_count == 0:
                     q_next.append(torch.tensor(0.0, device=self.device))
                     continue
@@ -201,12 +327,7 @@ class DQNTrainer:
 
                 with torch.no_grad():
                     if cfg.double_dqn:
-                        online_q = self._q_values(
-                            next_obs[i],
-                            int(next_obs_idx[i]),
-                            next_action_nodes[i, :n_count],
-                            next_action_edge[i, :n_count],
-                        )
+                        online_q = q_next_list[i].clone()
                         online_q[torch.tensor(~next_mask, device=self.device)] = -1e9
                         best = int(torch.argmax(online_q).item())
                         target_q = self._q_values(
@@ -217,12 +338,7 @@ class DQNTrainer:
                         )
                         q_next.append(target_q[best].detach())
                     else:
-                        target_q = self._q_values(
-                            next_obs[i],
-                            int(next_obs_idx[i]),
-                            next_action_nodes[i, :n_count],
-                            next_action_edge[i, :n_count],
-                        )
+                        target_q = q_next_list[i].clone()
                         target_q[torch.tensor(~next_mask, device=self.device)] = -1e9
                         q_next.append(torch.max(target_q).detach())
 
@@ -254,6 +370,7 @@ class DQNTrainer:
         episode_steps = 0
         stuck_sum = 0.0
         episode_index = 0
+        final_step = 0
 
         self.env.reset()
         try:
@@ -266,6 +383,7 @@ class DQNTrainer:
             iterator = tqdm(iterator, total=max_steps, desc="train", unit="step")
 
         for step in iterator:
+            final_step = int(step)
             eps = _linear_schedule(cfg.epsilon_start, cfg.epsilon_end, cfg.epsilon_decay_steps, step)
             features = self.env.get_feature_batch()
             mask = features["action_mask"].astype(bool)
@@ -375,6 +493,12 @@ class DQNTrainer:
                 if tqdm is not None:
                     iterator.set_postfix(loss=train_stats.get("loss", 0.0), eps=round(eps, 3))
 
+            if int(cfg.checkpoint_every_steps) > 0 and step % int(cfg.checkpoint_every_steps) == 0:
+                self._save_model(self.run_dir / "edgeq_model_latest.pt")
+                self._save_checkpoint(self.run_dir / "checkpoint_latest.pt", step=step, episode_index=episode_index)
+
+        self._save_model(self.run_dir / "edgeq_model_final.pt")
+        self._save_checkpoint(self.run_dir / "checkpoint_final.pt", step=final_step, episode_index=episode_index)
         return self.log_path
 
 

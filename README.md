@@ -41,6 +41,19 @@ This repository provides a maintainable and auditable scaffold for a community m
 - Training runner is still a baseline/diagnostic loop; DQNTrainer exists in `src/train/dqn.py` but is not wired into the CLI yet.
 - Curriculum learning, evaluator, and baselines remain pending (see `todos.md`).
 
+## Testing
+Core tests are isolated from baseline dependencies. The `baselines/` directory is excluded from pytest discovery via `pytest.ini`.
+
+```bash
+# Recommended: run all core tests
+pytest -q tests
+
+# Verbose output for debugging
+pytest -v tests
+```
+
+See `AGENTS.md` for more testing options and baseline setup notes.
+
 ## Quickstart (current)
 - Filter NYC trips by bbox (optional): `python scripts/filter_taxi_bbox.py --config configs/manhattan.yaml`
 - Map OD to legal stops: `python scripts/map_od.py --config configs/manhattan.yaml`

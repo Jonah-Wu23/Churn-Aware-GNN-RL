@@ -83,8 +83,20 @@ embeddings:
   output_path: "data/processed/graph/node2vec_embeddings.parquet"
   audit_path: "reports/audit/node2vec_embeddings.json"
 
+sumo:
+  sumo_cfg_path: ""
+  sumo_binary: "sumo"
+  sumo_gui: false
+  sumo_port: 8813
+  sumo_seed: 7
+  sumo_step_length: 1.0
+  sumo_start_time: 0.0
+  sumo_end_time: 36000.0
+  sumo_warmup_steps: 100
+  stop_to_sumo_edge_path: "data/processed/graph/stop_to_sumo_edge.json"
+
 curriculum:
-  stages: [L0, L1, L2, L3]
+  stages: [L0]
   trigger_rho: 0.8
   gamma: 1.0
   stage_max_steps: 50000
