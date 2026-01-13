@@ -129,9 +129,9 @@ class EventDrivenEnv:
             }
         else:
             self.stop_coords = {int(stop_id): (0.0, 0.0) for stop_id in self.stop_ids}
-        stop_index = {int(stop_id): idx for idx, stop_id in enumerate(self.stop_ids)}
-        src_idx = edges["source"].map(stop_index).astype(int).to_numpy()
-        dst_idx = edges["target"].map(stop_index).astype(int).to_numpy()
+        self.stop_index = {int(stop_id): idx for idx, stop_id in enumerate(self.stop_ids)}
+        src_idx = edges["source"].map(self.stop_index).astype(int).to_numpy()
+        dst_idx = edges["target"].map(self.stop_index).astype(int).to_numpy()
         self.graph_edge_index = np.stack([src_idx, dst_idx], axis=0).astype(np.int64)
         graph_edge_features = np.zeros((len(edges), 4), dtype=np.float32)
         graph_edge_features[:, 3] = edges["travel_time_sec"].to_numpy(dtype=np.float32)
@@ -159,6 +159,7 @@ class EventDrivenEnv:
             edges[["source", "target", "travel_time_sec"]].itertuples(index=False, name=None),
             weight="travel_time_sec",
         )
+        self._build_shortest_time_cache()
         self.neighbors: Dict[int, List[Tuple[int, float]]] = {}
         for src, dst, travel in edges.itertuples(index=False, name=None):
             self.neighbors.setdefault(int(src), []).append((int(dst), float(travel)))
@@ -170,6 +171,20 @@ class EventDrivenEnv:
         isolated = [stop_id for stop_id in self.stop_ids if stop_id not in self.neighbors]
         if isolated:
             LOG.warning("Layer 2 graph has %d stop(s) with no outgoing edges", len(isolated))
+
+    def _build_shortest_time_cache(self) -> None:
+        n = len(self.stop_ids)
+        shortest = np.full((n, n), np.inf, dtype=np.float32)
+        np.fill_diagonal(shortest, 0.0)
+        for src_stop_id in self.stop_ids:
+            src_idx = self.stop_index[int(src_stop_id)]
+            lengths = nx.single_source_dijkstra_path_length(self.graph, int(src_stop_id), weight="travel_time_sec")
+            for dst_stop_id, dist in lengths.items():
+                dst_idx = self.stop_index.get(int(dst_stop_id))
+                if dst_idx is None:
+                    continue
+                shortest[src_idx, dst_idx] = float(dist)
+        self.shortest_time_sec = shortest
 
     def _k_hop_nodes(self, center: int, k: int) -> List[int]:
         if k <= 0:
@@ -555,10 +570,11 @@ class EventDrivenEnv:
     def _shortest_time(self, src: int, dst: int) -> float:
         if src == dst:
             return 0.0
-        try:
-            return float(nx.shortest_path_length(self.graph, src, dst, weight="travel_time_sec"))
-        except nx.NetworkXNoPath:
+        src_idx = self.stop_index.get(int(src))
+        dst_idx = self.stop_index.get(int(dst))
+        if src_idx is None or dst_idx is None:
             return float("inf")
+        return float(self.shortest_time_sec[src_idx, dst_idx])
 
     def _apply_churn(self) -> Tuple[int, int, float, float, float, List[float], List[int], List[int]]:
         churned = 0
@@ -1007,6 +1023,10 @@ class EventDrivenEnv:
             "waiting_timeouts": float(self.waiting_timeouts),
             "onboard_churned": float(self.onboard_churned),
             "structural_unserviceable": float(self.structurally_unserviceable),
+            "total_requests": float(len(self.requests)),
+            "structural_unserviceable_rate": float(
+                self.structurally_unserviceable / max(1, len(self.requests))
+            ),
             "algorithmic_churned": float(self.waiting_churned + self.onboard_churned),
             "step_served": float(self._step_stats["served"]),
             "step_waiting_churned": float(self._step_stats["waiting_churned"]),

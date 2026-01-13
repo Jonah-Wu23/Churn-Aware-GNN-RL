@@ -58,6 +58,33 @@ env:
   graph_edges_path: "data/processed/graph/layer2_edges.parquet"
   graph_embeddings_path: "data/processed/graph/node2vec_embeddings.parquet"
 
+train:
+  seed: 7
+  total_steps: 200000
+  buffer_size: 100000
+  batch_size: 256
+  learning_starts: 5000
+  train_freq: 4
+  gradient_steps: 1
+  target_update_interval: 2000
+  gamma: 0.99
+  learning_rate: 0.0003
+  max_grad_norm: 10.0
+  double_dqn: true
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_steps: 100000
+  log_every_steps: 1000
+  checkpoint_every_steps: 10000
+  device: cuda
+
+model:
+  node_dim: 5
+  edge_dim: 4
+  hidden_dim: 128
+  num_layers: 4
+  dropout: 0.15
+
 eval:
   episodes: 5
   seed: 7

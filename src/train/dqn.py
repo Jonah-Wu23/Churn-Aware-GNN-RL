@@ -169,75 +169,9 @@ class DQNTrainer:
             extra=meta,
         )
 
-    def _q_values_batch(self, obs: np.ndarray, obs_idx: np.ndarray, action_nodes: np.ndarray, action_edge: np.ndarray, action_counts: np.ndarray, requires_grad: bool = False) -> list[torch.Tensor]:
-        """批量计算Q值，返回每个样本的Q值tensor列表。"""
-        batch_size = len(obs)
-        q_values_list = []
-
-        total_actions = int(action_counts.sum())
-        if total_actions == 0:
-            return [torch.tensor([], device=self.device) for _ in range(batch_size)]
-
-        num_nodes = obs.shape[1]
-        x_list = []
-        graph_edge_index_list = []
-        graph_edge_attr_list = []
-        src_list = []
-        dst_list = []
-        edge_list = []
-        
-        for i in range(batch_size):
-            count = int(action_counts[i])
-            if count > 0:
-                node_offset = i * num_nodes
-                x_list.append(torch.tensor(obs[i], dtype=torch.float32, device=self.device))
-                
-                graph_ei = self.graph_edge_index.clone()
-                graph_ei = graph_ei + node_offset
-                graph_edge_index_list.append(graph_ei)
-                graph_edge_attr_list.append(self.graph_edge_features)
-                
-                src_list.extend([int(obs_idx[i]) + node_offset] * count)
-                dst_list.extend([int(action_nodes[i, j]) + node_offset for j in range(count)])
-                edge_list.extend(action_edge[i, :count].tolist())
-
-        if len(x_list) == 0:
-            return [torch.tensor([], device=self.device) for _ in range(batch_size)]
-
-        x = torch.cat(x_list, dim=0)
-        graph_edge_index = torch.cat(graph_edge_index_list, dim=1)
-        graph_edge_attr = torch.cat(graph_edge_attr_list, dim=0)
-        src = torch.tensor(src_list, dtype=torch.long, device=self.device)
-        dst = torch.tensor(dst_list, dtype=torch.long, device=self.device)
-        action_edge_index = torch.stack([src, dst], dim=0)
-        edge_attr = torch.tensor(edge_list, dtype=torch.float32, device=self.device)
-
-        data = {
-            "node_features": x,
-            "graph_edge_index": graph_edge_index,
-            "graph_edge_features": graph_edge_attr,
-            "action_edge_index": action_edge_index,
-            "edge_features": edge_attr,
-        }
-
-        if requires_grad:
-            q_all = self.model(data)
-        else:
-            with torch.no_grad():
-                q_all = self.model(data).detach()
-
-        offset = 0
-        for i in range(batch_size):
-            count = int(action_counts[i])
-            if count > 0:
-                q_values_list.append(q_all[offset:offset + count])
-                offset += count
-            else:
-                q_values_list.append(torch.tensor([], device=self.device))
-
-        return q_values_list
-
-    def _q_values(self, obs: np.ndarray, obs_idx: int, action_nodes: np.ndarray, action_edge: np.ndarray) -> torch.Tensor:
+    def _q_values_single(self, obs: np.ndarray, obs_idx: int, action_nodes: np.ndarray, action_edge: np.ndarray, model: Optional[nn.Module] = None, requires_grad: bool = True) -> torch.Tensor:
+        """计算单个样本的Q值，共享图结构，显存友好。"""
+        active_model = self.model if model is None else model
         x = torch.tensor(obs, dtype=torch.float32, device=self.device)
         dst = torch.tensor(action_nodes, dtype=torch.long, device=self.device)
         src = torch.full_like(dst, int(obs_idx), dtype=torch.long, device=self.device)
@@ -250,7 +184,27 @@ class DQNTrainer:
             "action_edge_index": action_edge_index,
             "edge_features": edge_attr,
         }
-        return self.model(data)
+        if requires_grad:
+            return active_model(data)
+        else:
+            with torch.no_grad():
+                return active_model(data).detach()
+
+    def _q_values(self, obs: np.ndarray, obs_idx: int, action_nodes: np.ndarray, action_edge: np.ndarray, model: Optional[nn.Module] = None) -> torch.Tensor:
+        active_model = self.model if model is None else model
+        x = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        dst = torch.tensor(action_nodes, dtype=torch.long, device=self.device)
+        src = torch.full_like(dst, int(obs_idx), dtype=torch.long, device=self.device)
+        action_edge_index = torch.stack([src, dst], dim=0)
+        edge_attr = torch.tensor(action_edge, dtype=torch.float32, device=self.device)
+        data = {
+            "node_features": x,
+            "graph_edge_index": self.graph_edge_index,
+            "graph_edge_features": self.graph_edge_features,
+            "action_edge_index": action_edge_index,
+            "edge_features": edge_attr,
+        }
+        return active_model(data)
 
     def _select_action(self, features: Dict[str, np.ndarray], epsilon: float) -> Optional[int]:
         actions = features["actions"].astype(np.int64)
@@ -278,6 +232,7 @@ class DQNTrainer:
             return int(actions[idx])
 
     def _optimize(self, global_step: int) -> Dict[str, float]:
+        """优化步骤，使用逐样本处理+梯度累积，共享图结构避免显存爆炸。"""
         cfg = self.config
         if self.buffer.size < int(cfg.learning_starts):
             return {}
@@ -302,60 +257,83 @@ class DQNTrainer:
             next_action_mask = batch["next_action_mask"]
             next_action_count = batch["next_action_count"]
 
-            rewards = torch.tensor(batch["reward"], dtype=torch.float32, device=self.device)
-            done = torch.tensor(batch["done"].astype(np.float32), dtype=torch.float32, device=self.device)
+            rewards = batch["reward"]
+            dones = batch["done"].astype(np.float32)
 
-            q_pred = []
-            q_next = []
+            self.optimizer.zero_grad()
+            batch_loss = 0.0
+            valid_samples = 0
 
-            q_pred_list = self._q_values_batch(obs, obs_idx, action_nodes, action_edge, action_count, requires_grad=True)
             for i in range(len(obs)):
                 a_count = int(action_count[i])
                 if a_count == 0:
-                    q_pred.append(torch.tensor(0.0, device=self.device))
-                else:
-                    q_pred.append(q_pred_list[i][int(action_taken[i])])
+                    continue
 
-            q_next_list = self._q_values_batch(next_obs, next_obs_idx, next_action_nodes, next_action_edge, next_action_count, requires_grad=False)
-            for i in range(len(obs)):
+                q_all = self._q_values_single(
+                    obs[i],
+                    int(obs_idx[i]),
+                    action_nodes[i, :a_count],
+                    action_edge[i, :a_count],
+                    requires_grad=True,
+                )
+                q_pred = q_all[int(action_taken[i])]
+
                 n_count = int(next_action_count[i])
                 if n_count == 0:
-                    q_next.append(torch.tensor(0.0, device=self.device))
-                    continue
-
-                next_mask = next_action_mask[i, :n_count].astype(bool)
-                if not np.any(next_mask):
-                    q_next.append(torch.tensor(0.0, device=self.device))
-                    continue
-
-                with torch.no_grad():
-                    if cfg.double_dqn:
-                        online_q = q_next_list[i].clone()
-                        online_q[torch.tensor(~next_mask, device=self.device)] = -1e9
-                        best = int(torch.argmax(online_q).item())
-                        target_q = self._q_values(
-                            next_obs[i],
-                            int(next_obs_idx[i]),
-                            next_action_nodes[i, :n_count],
-                            next_action_edge[i, :n_count],
-                        )
-                        q_next.append(target_q[best].detach())
+                    q_next_val = 0.0
+                else:
+                    next_mask = next_action_mask[i, :n_count].astype(bool)
+                    if not np.any(next_mask):
+                        q_next_val = 0.0
                     else:
-                        target_q = q_next_list[i].clone()
-                        target_q[torch.tensor(~next_mask, device=self.device)] = -1e9
-                        q_next.append(torch.max(target_q).detach())
+                        with torch.no_grad():
+                            if cfg.double_dqn:
+                                online_q = self._q_values_single(
+                                    next_obs[i],
+                                    int(next_obs_idx[i]),
+                                    next_action_nodes[i, :n_count],
+                                    next_action_edge[i, :n_count],
+                                    requires_grad=False,
+                                )
+                                online_q_masked = online_q.clone()
+                                online_q_masked[torch.tensor(~next_mask, device=self.device)] = -1e9
+                                best = int(torch.argmax(online_q_masked).item())
+                                target_q = self._q_values_single(
+                                    next_obs[i],
+                                    int(next_obs_idx[i]),
+                                    next_action_nodes[i, :n_count],
+                                    next_action_edge[i, :n_count],
+                                    model=self.target_model,
+                                    requires_grad=False,
+                                )
+                                q_next_val = float(target_q[best].item())
+                            else:
+                                target_q = self._q_values_single(
+                                    next_obs[i],
+                                    int(next_obs_idx[i]),
+                                    next_action_nodes[i, :n_count],
+                                    next_action_edge[i, :n_count],
+                                    model=self.target_model,
+                                    requires_grad=False,
+                                )
+                                target_q_masked = target_q.clone()
+                                target_q_masked[torch.tensor(~next_mask, device=self.device)] = -1e9
+                                q_next_val = float(torch.max(target_q_masked).item())
 
-            q_pred_t = torch.stack(q_pred)
-            q_next_t = torch.stack(q_next)
-            target = rewards + float(cfg.gamma) * (1.0 - done) * q_next_t
+                target = float(rewards[i]) + float(cfg.gamma) * (1.0 - float(dones[i])) * q_next_val
+                target_t = torch.tensor(target, dtype=torch.float32, device=self.device)
 
-            loss = F.smooth_l1_loss(q_pred_t, target)
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), float(cfg.max_grad_norm))
-            self.optimizer.step()
+                sample_loss = F.smooth_l1_loss(q_pred, target_t)
+                sample_loss_scaled = sample_loss / float(cfg.batch_size)
+                sample_loss_scaled.backward()
 
-            losses.append(float(loss.item()))
+                batch_loss += float(sample_loss.item())
+                valid_samples += 1
+
+            if valid_samples > 0:
+                nn.utils.clip_grad_norm_(self.model.parameters(), float(cfg.max_grad_norm))
+                self.optimizer.step()
+                losses.append(batch_loss / valid_samples)
 
         if global_step % int(cfg.target_update_interval) == 0:
             self.target_model.load_state_dict(self.model.state_dict())

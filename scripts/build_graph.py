@@ -26,6 +26,7 @@ def parse_args():
     parser.add_argument("--neighbor-k", type=int)
     parser.add_argument("--out-dir")
     parser.add_argument("--audit-path")
+    parser.add_argument("--ensure-strong-connectivity", action="store_true", help="Add bridging edges to ensure strong connectivity")
     return parser.parse_args()
 
 
@@ -43,6 +44,7 @@ def main():
     min_travel_time_sec = graph_cfg.get("min_travel_time_sec", 1.0)
     prune_zero_in = bool(graph_cfg.get("prune_zero_in", False))
     prune_zero_out = bool(graph_cfg.get("prune_zero_out", False))
+    ensure_strong_connectivity = args.ensure_strong_connectivity or bool(graph_cfg.get("ensure_strong_connectivity", False))
 
     bbox = None
     if all(value is not None for value in (args.north, args.south, args.east, args.west)):
@@ -75,6 +77,7 @@ def main():
         min_travel_time_sec=float(min_travel_time_sec),
         prune_zero_in=prune_zero_in,
         prune_zero_out=prune_zero_out,
+        ensure_strong_connectivity=ensure_strong_connectivity,
     )
 
 

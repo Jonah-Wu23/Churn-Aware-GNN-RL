@@ -247,6 +247,175 @@ def _fix_zero_travel_times(
     }
 
 
+def _compute_scc_stats(
+    graph: nx.DiGraph,
+    coords: Dict[int, Tuple[float, float]],
+) -> Dict[str, object]:
+    """Compute strongly connected component statistics."""
+    sccs = list(nx.strongly_connected_components(graph))
+    if len(sccs) <= 1:
+        return {
+            "scc_count": len(sccs),
+            "scc_sizes": [len(scc) for scc in sccs],
+            "sources": [],
+            "sinks": [],
+            "strongly_connected": len(sccs) == 1,
+        }
+
+    condensation = nx.condensation(graph)
+    in_deg = dict(condensation.in_degree())
+    out_deg = dict(condensation.out_degree())
+    sources = [i for i in condensation.nodes if in_deg.get(i, 0) == 0]
+    sinks = [i for i in condensation.nodes if out_deg.get(i, 0) == 0]
+
+    scc_sizes = []
+    for i in sorted(condensation.nodes):
+        members = condensation.nodes[i]["members"]
+        scc_sizes.append(len(members))
+
+    return {
+        "scc_count": len(sccs),
+        "scc_sizes": scc_sizes,
+        "sources": sources,
+        "sinks": sinks,
+        "strongly_connected": False,
+    }
+
+
+def _ensure_strong_connectivity(
+    edges_df: pd.DataFrame,
+    nodes_df: pd.DataFrame,
+    coords: Dict[int, Tuple[float, float]],
+    fallback_speed_mps: float,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    """Add minimal bridging edges to make the graph strongly connected.
+
+    Uses SCC condensation to identify sources and sinks, then adds edges
+    from sinks back to sources in a cyclic pattern.
+    """
+    graph = nx.DiGraph()
+    graph.add_nodes_from(nodes_df["gnn_node_id"].astype(int).tolist())
+    graph.add_edges_from(
+        edges_df[["source", "target"]].astype(int).itertuples(index=False, name=None)
+    )
+
+    if nx.is_strongly_connected(graph):
+        return edges_df, {
+            "bridging_edges_added": 0,
+            "scc_count_before": 1,
+            "scc_count_after": 1,
+            "strongly_connected_before": True,
+            "strongly_connected_after": True,
+        }
+
+    condensation = nx.condensation(graph)
+    scc_count_before = condensation.number_of_nodes()
+    in_deg = dict(condensation.in_degree())
+    out_deg = dict(condensation.out_degree())
+    sources = sorted([i for i in condensation.nodes if in_deg.get(i, 0) == 0])
+    sinks = sorted([i for i in condensation.nodes if out_deg.get(i, 0) == 0])
+
+    if not sources or not sinks:
+        LOG.warning("No sources or sinks found in condensation; skipping SCC stitching")
+        return edges_df, {
+            "bridging_edges_added": 0,
+            "scc_count_before": scc_count_before,
+            "scc_count_after": scc_count_before,
+            "strongly_connected_before": False,
+            "strongly_connected_after": False,
+            "error": "no_sources_or_sinks",
+        }
+
+    def _scc_centroid(scc_id: int) -> Tuple[float, float]:
+        members = condensation.nodes[scc_id]["members"]
+        lons = [coords[m][0] for m in members if m in coords]
+        lats = [coords[m][1] for m in members if m in coords]
+        if not lons:
+            return (0.0, 0.0)
+        return (float(np.mean(lons)), float(np.mean(lats)))
+
+    def _nearest_node_to_centroid(scc_id: int, centroid: Tuple[float, float]) -> int:
+        members = list(condensation.nodes[scc_id]["members"])
+        if not members:
+            raise ValueError(f"SCC {scc_id} has no members")
+        best_node = members[0]
+        best_dist = float("inf")
+        for node in members:
+            if node not in coords:
+                continue
+            dist = _haversine_meters(coords[node][0], coords[node][1], centroid[0], centroid[1])
+            if dist < best_dist:
+                best_dist = dist
+                best_node = node
+        return int(best_node)
+
+    k = max(len(sources), len(sinks))
+    while len(sources) < k:
+        sources.append(sources[len(sources) % len(sources)])
+    while len(sinks) < k:
+        sinks.append(sinks[len(sinks) % len(sinks)])
+
+    new_edges = []
+    existing_edges = set(
+        zip(edges_df["source"].astype(int).tolist(), edges_df["target"].astype(int).tolist())
+    )
+
+    for i in range(k):
+        sink_id = sinks[i]
+        source_id = sources[(i + 1) % len(sources)]
+        if sink_id == source_id:
+            continue
+
+        sink_centroid = _scc_centroid(sink_id)
+        source_centroid = _scc_centroid(source_id)
+        sink_node = _nearest_node_to_centroid(sink_id, sink_centroid)
+        source_node = _nearest_node_to_centroid(source_id, source_centroid)
+
+        if (sink_node, source_node) in existing_edges:
+            continue
+
+        if sink_node in coords and source_node in coords:
+            dist = _haversine_meters(
+                coords[sink_node][0], coords[sink_node][1],
+                coords[source_node][0], coords[source_node][1],
+            )
+            travel_time = dist / max(fallback_speed_mps, 0.1)
+        else:
+            travel_time = 300.0
+
+        new_edges.append({
+            "source": int(sink_node),
+            "target": int(source_node),
+            "travel_time_sec": float(travel_time),
+        })
+        existing_edges.add((sink_node, source_node))
+        LOG.info(
+            "Added bridging edge: %d -> %d (SCC %d -> SCC %d, %.1f sec)",
+            sink_node, source_node, sink_id, source_id, travel_time,
+        )
+
+    if new_edges:
+        new_edges_df = pd.DataFrame(new_edges)
+        edges_df = pd.concat([edges_df, new_edges_df], ignore_index=True)
+
+    graph_after = nx.DiGraph()
+    graph_after.add_nodes_from(nodes_df["gnn_node_id"].astype(int).tolist())
+    graph_after.add_edges_from(
+        edges_df[["source", "target"]].astype(int).itertuples(index=False, name=None)
+    )
+    strongly_connected_after = nx.is_strongly_connected(graph_after)
+    scc_count_after = nx.number_strongly_connected_components(graph_after)
+
+    return edges_df, {
+        "bridging_edges_added": len(new_edges),
+        "bridging_edges": new_edges,
+        "scc_count_before": scc_count_before,
+        "scc_count_after": scc_count_after,
+        "strongly_connected_before": False,
+        "strongly_connected_after": strongly_connected_after,
+    }
+
+
 def _prune_graph(
     nodes: pd.DataFrame,
     edges: pd.DataFrame,
@@ -497,6 +666,7 @@ def build_logical_graph(
     min_travel_time_sec: float = 1.0,
     prune_zero_in: bool = False,
     prune_zero_out: bool = False,
+    ensure_strong_connectivity: bool = False,
 ) -> None:
     """Entry point for building Layer 2 logical dispatch graph."""
     if not place_name and not bbox:
@@ -538,6 +708,13 @@ def build_logical_graph(
         prune_zero_in=prune_zero_in,
         prune_zero_out=prune_zero_out,
     )
+
+    scc_stitch_stats = {}
+    if ensure_strong_connectivity:
+        edges_df, scc_stitch_stats = _ensure_strong_connectivity(
+            edges_df, nodes_df, coords, fallback_speed,
+        )
+
     keep_nodes = set(nodes_df["gnn_node_id"].astype(int).tolist())
     gdf_stops = gdf_stops[gdf_stops["gnn_node_id"].astype(int).isin(keep_nodes)].copy()
     save_graph_artifacts(out_dir, gdf_stops, edges_df.to_dict("records"))
@@ -557,6 +734,8 @@ def build_logical_graph(
         "prune_zero_in": bool(prune_zero_in),
         "prune_zero_out": bool(prune_zero_out),
         "prune_stats": prune_stats,
+        "ensure_strong_connectivity": bool(ensure_strong_connectivity),
+        "scc_stitch_stats": scc_stitch_stats,
     }
     write_audit_report(
         out_dir,
@@ -578,6 +757,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cutoff-sec", type=int, default=900)
     parser.add_argument("--neighbor-k", type=int, default=20)
     parser.add_argument("--out-dir", default="data/processed/graph")
+    parser.add_argument("--ensure-strong-connectivity", action="store_true", help="Add bridging edges to ensure strong connectivity")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args(argv)
 
@@ -599,6 +779,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         cutoff_sec=args.cutoff_sec,
         neighbor_k=args.neighbor_k,
         out_dir=Path(args.out_dir),
+        ensure_strong_connectivity=args.ensure_strong_connectivity,
     )
 
 
