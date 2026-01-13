@@ -169,7 +169,7 @@ class DQNTrainer:
             extra=meta,
         )
 
-    def _q_values_batch(self, obs: np.ndarray, obs_idx: np.ndarray, action_nodes: np.ndarray, action_edge: np.ndarray, action_counts: np.ndarray) -> list[torch.Tensor]:
+    def _q_values_batch(self, obs: np.ndarray, obs_idx: np.ndarray, action_nodes: np.ndarray, action_edge: np.ndarray, action_counts: np.ndarray, requires_grad: bool = False) -> list[torch.Tensor]:
         """批量计算Q值，返回每个样本的Q值tensor列表。"""
         batch_size = len(obs)
         q_values_list = []
@@ -220,8 +220,11 @@ class DQNTrainer:
             "edge_features": edge_attr,
         }
 
-        with torch.no_grad():
-            q_all = self.model(data).detach()
+        if requires_grad:
+            q_all = self.model(data)
+        else:
+            with torch.no_grad():
+                q_all = self.model(data).detach()
 
         offset = 0
         for i in range(batch_size):
@@ -305,7 +308,7 @@ class DQNTrainer:
             q_pred = []
             q_next = []
 
-            q_pred_list = self._q_values_batch(obs, obs_idx, action_nodes, action_edge, action_count)
+            q_pred_list = self._q_values_batch(obs, obs_idx, action_nodes, action_edge, action_count, requires_grad=True)
             for i in range(len(obs)):
                 a_count = int(action_count[i])
                 if a_count == 0:
@@ -313,7 +316,7 @@ class DQNTrainer:
                 else:
                     q_pred.append(q_pred_list[i][int(action_taken[i])])
 
-            q_next_list = self._q_values_batch(next_obs, next_obs_idx, next_action_nodes, next_action_edge, next_action_count)
+            q_next_list = self._q_values_batch(next_obs, next_obs_idx, next_action_nodes, next_action_edge, next_action_count, requires_grad=False)
             for i in range(len(obs)):
                 n_count = int(next_action_count[i])
                 if n_count == 0:
