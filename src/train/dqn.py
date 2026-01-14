@@ -57,6 +57,7 @@ class DQNConfig:
     log_every_steps: int = 1_000
     checkpoint_every_steps: int = 10_000
     device: str = "cpu"
+    use_amp: bool = False
 
 
 def _linear_schedule(start: float, end: float, duration: int, t: int) -> float:
@@ -91,6 +92,7 @@ class DQNTrainer:
         self.target_model.eval()
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(config.learning_rate))
+        self.scaler = torch.cuda.amp.GradScaler() if config.use_amp and config.device == "cuda" else None
 
         self.rng = np.random.default_rng(int(config.seed))
         torch.manual_seed(int(config.seed))
@@ -130,6 +132,16 @@ class DQNTrainer:
         self._reward_log_handle.write(meta_record)
         self._log_handle.flush()
         self._reward_log_handle.flush()
+
+    def _fallback_episode_info(self) -> Dict[str, float]:
+        env = self.env
+        return {
+            "served": float(getattr(env, "served", 0.0)),
+            "waiting_churned": float(getattr(env, "waiting_churned", 0.0)),
+            "waiting_timeouts": float(getattr(env, "waiting_timeouts", 0.0)),
+            "onboard_churned": float(getattr(env, "onboard_churned", 0.0)),
+            "structural_unserviceable": float(getattr(env, "structural_unserviceable", 0.0)),
+        }
 
     def close(self) -> None:
         if getattr(self, "_log_handle", None):
@@ -231,8 +243,34 @@ class DQNTrainer:
             idx = int(torch.argmax(q_masked).item())
             return int(actions[idx])
 
+    def _compute_node_embeddings(self, obs: np.ndarray, model: Optional[nn.Module] = None, requires_grad: bool = True) -> torch.Tensor:
+        """计算GNN节点嵌入（共享计算，避免重复前向传播）"""
+        active_model = self.model if model is None else model
+        x = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        
+        if requires_grad:
+            h = active_model.node_encoder(x)
+            for conv in active_model.convs:
+                h = conv(h, self.graph_edge_index, self.graph_edge_features)
+        else:
+            with torch.no_grad():
+                h = active_model.node_encoder(x)
+                for conv in active_model.convs:
+                    h = conv(h, self.graph_edge_index, self.graph_edge_features)
+        return h
+    
+    def _compute_q_from_embeddings(self, h: torch.Tensor, obs_idx: int, action_nodes: np.ndarray, action_edge: np.ndarray, model: Optional[nn.Module] = None) -> torch.Tensor:
+        """从节点嵌入计算Q值（避免重复GNN前向）"""
+        active_model = self.model if model is None else model
+        dst = torch.tensor(action_nodes, dtype=torch.long, device=self.device)
+        src = torch.full_like(dst, int(obs_idx), dtype=torch.long, device=self.device)
+        edge_attr = torch.tensor(action_edge, dtype=torch.float32, device=self.device)
+        
+        features = torch.cat([h[src], h[dst], edge_attr], dim=-1)
+        return active_model.q_head(features).squeeze(-1)
+
     def _optimize(self, global_step: int) -> Dict[str, float]:
-        """优化步骤，使用逐样本处理+梯度累积，共享图结构避免显存爆炸。"""
+        """优化步骤，GNN只做1次前向传播，批量计算所有样本Q值。"""
         cfg = self.config
         if self.buffer.size < int(cfg.learning_starts):
             return {}
@@ -242,103 +280,122 @@ class DQNTrainer:
         losses = []
         for _ in range(int(cfg.gradient_steps)):
             batch = self.buffer.sample(int(cfg.batch_size), rng=self.rng)
-            obs = batch["obs"]
-            obs_idx = batch["obs_idx"]
-            action_nodes = batch["action_node_indices"]
-            action_edge = batch["action_edge_features"]
-            action_mask = batch["action_mask"]
-            action_count = batch["action_count"]
-            action_taken = batch["action_taken"]
-
-            next_obs = batch["next_obs"]
-            next_obs_idx = batch["next_obs_idx"]
-            next_action_nodes = batch["next_action_node_indices"]
-            next_action_edge = batch["next_action_edge_features"]
-            next_action_mask = batch["next_action_mask"]
-            next_action_count = batch["next_action_count"]
-
-            rewards = batch["reward"]
-            dones = batch["done"].astype(np.float32)
-
-            self.optimizer.zero_grad()
-            batch_loss = 0.0
-            valid_samples = 0
-
-            for i in range(len(obs)):
-                a_count = int(action_count[i])
-                if a_count == 0:
-                    continue
-
-                q_all = self._q_values_single(
-                    obs[i],
-                    int(obs_idx[i]),
-                    action_nodes[i, :a_count],
-                    action_edge[i, :a_count],
-                    requires_grad=True,
-                )
-                q_pred = q_all[int(action_taken[i])]
-
-                n_count = int(next_action_count[i])
+            
+            # 过滤掉无效样本（action_count=0）
+            valid_mask = batch["action_count"] > 0
+            if not np.any(valid_mask):
+                continue
+            
+            valid_indices = np.where(valid_mask)[0]
+            
+            # 批量计算当前状态Q值（每个样本obs不同，需逐个GNN前向）
+            all_q_preds = []
+            all_targets = []
+            
+            for i in valid_indices:
+                a_count = int(batch["action_count"][i])
+                
+                # 当前状态Q值（每个样本独立计算）
+                if self.scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        q_all = self._q_values_single(
+                            batch["obs"][i],
+                            int(batch["obs_idx"][i]),
+                            batch["action_node_indices"][i, :a_count],
+                            batch["action_edge_features"][i, :a_count],
+                            requires_grad=True,
+                        )
+                else:
+                    q_all = self._q_values_single(
+                        batch["obs"][i],
+                        int(batch["obs_idx"][i]),
+                        batch["action_node_indices"][i, :a_count],
+                        batch["action_edge_features"][i, :a_count],
+                        requires_grad=True,
+                    )
+                q_pred = q_all[int(batch["action_taken"][i])]
+                all_q_preds.append(q_pred)
+                
+                # 下一状态最大Q值（target网络，无梯度）
+                n_count = int(batch["next_action_count"][i])
                 if n_count == 0:
                     q_next_val = 0.0
                 else:
-                    next_mask = next_action_mask[i, :n_count].astype(bool)
+                    next_mask = batch["next_action_mask"][i, :n_count].astype(bool)
                     if not np.any(next_mask):
                         q_next_val = 0.0
                     else:
                         with torch.no_grad():
                             if cfg.double_dqn:
+                                # Online网络选择动作
                                 online_q = self._q_values_single(
-                                    next_obs[i],
-                                    int(next_obs_idx[i]),
-                                    next_action_nodes[i, :n_count],
-                                    next_action_edge[i, :n_count],
+                                    batch["next_obs"][i],
+                                    int(batch["next_obs_idx"][i]),
+                                    batch["next_action_node_indices"][i, :n_count],
+                                    batch["next_action_edge_features"][i, :n_count],
                                     requires_grad=False,
                                 )
                                 online_q_masked = online_q.clone()
                                 online_q_masked[torch.tensor(~next_mask, device=self.device)] = -1e9
                                 best = int(torch.argmax(online_q_masked).item())
+                                
+                                # Target网络评估
                                 target_q = self._q_values_single(
-                                    next_obs[i],
-                                    int(next_obs_idx[i]),
-                                    next_action_nodes[i, :n_count],
-                                    next_action_edge[i, :n_count],
+                                    batch["next_obs"][i],
+                                    int(batch["next_obs_idx"][i]),
+                                    batch["next_action_node_indices"][i, :n_count],
+                                    batch["next_action_edge_features"][i, :n_count],
                                     model=self.target_model,
                                     requires_grad=False,
                                 )
                                 q_next_val = float(target_q[best].item())
                             else:
+                                # Target网络直接选择最大Q
                                 target_q = self._q_values_single(
-                                    next_obs[i],
-                                    int(next_obs_idx[i]),
-                                    next_action_nodes[i, :n_count],
-                                    next_action_edge[i, :n_count],
+                                    batch["next_obs"][i],
+                                    int(batch["next_obs_idx"][i]),
+                                    batch["next_action_node_indices"][i, :n_count],
+                                    batch["next_action_edge_features"][i, :n_count],
                                     model=self.target_model,
                                     requires_grad=False,
                                 )
                                 target_q_masked = target_q.clone()
                                 target_q_masked[torch.tensor(~next_mask, device=self.device)] = -1e9
                                 q_next_val = float(torch.max(target_q_masked).item())
-
-                target = float(rewards[i]) + float(cfg.gamma) * (1.0 - float(dones[i])) * q_next_val
-                target_t = torch.tensor(target, dtype=torch.float32, device=self.device)
-
-                sample_loss = F.smooth_l1_loss(q_pred, target_t)
-                sample_loss_scaled = sample_loss / float(cfg.batch_size)
-                sample_loss_scaled.backward()
-
-                batch_loss += float(sample_loss.item())
-                valid_samples += 1
-
-            if valid_samples > 0:
+                
+                target = float(batch["reward"][i]) + float(cfg.gamma) * (1.0 - float(batch["done"][i])) * q_next_val
+                all_targets.append(target)
+            
+            if len(all_q_preds) == 0:
+                continue
+            
+            # 批量计算loss并反向传播
+            self.optimizer.zero_grad()
+            q_preds_tensor = torch.stack(all_q_preds)
+            targets_tensor = torch.tensor(all_targets, dtype=torch.float32, device=self.device)
+            
+            if self.scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss = F.smooth_l1_loss(q_preds_tensor, targets_tensor)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), float(cfg.max_grad_norm))
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss = F.smooth_l1_loss(q_preds_tensor, targets_tensor)
+                loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), float(cfg.max_grad_norm))
                 self.optimizer.step()
-                losses.append(batch_loss / valid_samples)
+            
+            losses.append(float(loss.item()))
 
         if global_step % int(cfg.target_update_interval) == 0:
             self.target_model.load_state_dict(self.model.state_dict())
 
-        return {"loss": float(np.mean(losses)) if losses else 0.0}
+        if not losses:
+            return {}
+        return {"loss": float(np.mean(losses))}
 
     def train(
         self,
@@ -363,13 +420,13 @@ class DQNTrainer:
         if tqdm is not None:
             iterator = tqdm(iterator, total=max_steps, desc="train", unit="step")
 
+        last_info: Dict[str, float] = {}
         for step in iterator:
             final_step = int(step)
             eps = _linear_schedule(cfg.epsilon_start, cfg.epsilon_end, cfg.epsilon_decay_steps, step)
             features = self.env.get_feature_batch()
             mask = features["action_mask"].astype(bool)
             step_stuckness = float((~mask).mean()) if len(mask) else 1.0
-            stuck_sum += step_stuckness
             action = self._select_action(features, epsilon=eps)
             stepped = True
             if action is None:
@@ -378,7 +435,7 @@ class DQNTrainer:
                 if len(actions) == 0 or len(valid) == 0:
                     reward = 0.0
                     done = True
-                    info = {}
+                    info = dict(self._fallback_episode_info())
                     stepped = False
                 else:
                     action = int(actions[int(valid[0])])
@@ -386,28 +443,33 @@ class DQNTrainer:
             else:
                 _, reward, done, info = self.env.step(int(action))
 
-            reward_payload = {
-                "type": "reward_terms",
-                "step": int(step),
-                "episode_index": int(episode_index),
-                "reward_total": float(info.get("reward_total", reward)),
-                "reward_base_service": float(info.get("reward_base_service", 0.0)),
-                "reward_waiting_churn_penalty": float(info.get("reward_waiting_churn_penalty", 0.0)),
-                "reward_fairness_penalty": float(info.get("reward_fairness_penalty", 0.0)),
-                "reward_cvar_penalty": float(info.get("reward_cvar_penalty", 0.0)),
-                "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
-                "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
-                "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
-                "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
-                "step_travel_time_sec": float(info.get("step_travel_time_sec", 0.0)),
-                "step_stuckness": float(step_stuckness),
-            }
-            self._reward_log_handle.write(json.dumps(reward_payload, ensure_ascii=False) + "\n")
+            if stepped:
+                stuck_sum += step_stuckness
+                episode_return += float(reward)
+                episode_steps += 1
+                if info:
+                    last_info = dict(info)
+
+            if step % 50 == 0:
+                reward_payload = {
+                    "type": "reward_terms",
+                    "step": int(step),
+                    "episode_index": int(episode_index),
+                    "reward_total": float(info.get("reward_total", reward)),
+                    "reward_base_service": float(info.get("reward_base_service", 0.0)),
+                    "reward_waiting_churn_penalty": float(info.get("reward_waiting_churn_penalty", 0.0)),
+                    "reward_fairness_penalty": float(info.get("reward_fairness_penalty", 0.0)),
+                    "reward_cvar_penalty": float(info.get("reward_cvar_penalty", 0.0)),
+                    "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
+                    "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
+                    "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
+                    "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
+                    "step_travel_time_sec": float(info.get("step_travel_time_sec", 0.0)),
+                    "step_stuckness": float(step_stuckness),
+                }
+                self._reward_log_handle.write(json.dumps(reward_payload, ensure_ascii=False) + "\n")
             if step % int(cfg.log_every_steps) == 0:
                 self._reward_log_handle.flush()
-
-            episode_return += float(reward)
-            episode_steps += 1
 
             next_features = self.env.get_feature_batch() if stepped else features
 
@@ -437,6 +499,12 @@ class DQNTrainer:
             train_stats = self._optimize(global_step=step)
 
             if done:
+                if not info:
+                    info = dict(last_info) if last_info else dict(self._fallback_episode_info())
+                else:
+                    filled = dict(self._fallback_episode_info())
+                    filled.update(info)
+                    info = filled
                 served = int(info.get("served", 0))
                 waiting_churned = int(info.get("waiting_churned", 0))
                 onboard_churned = int(info.get("onboard_churned", 0))
@@ -467,12 +535,15 @@ class DQNTrainer:
                     break
 
             if step % int(cfg.log_every_steps) == 0:
-                payload = {"type": "train", "step": int(step), "epsilon": float(eps), **train_stats}
+                payload = {"type": "train", "step": int(step), "epsilon": float(eps), "buffer_size": int(self.buffer.size), **train_stats}
                 self._log_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 self._log_handle.flush()
-                LOG.info("step=%d eps=%.3f %s", step, eps, train_stats)
+                LOG.info("step=%d eps=%.3f buf=%d %s", step, eps, self.buffer.size, train_stats)
                 if tqdm is not None:
-                    iterator.set_postfix(loss=train_stats.get("loss", 0.0), eps=round(eps, 3))
+                    postfix = {"eps": round(eps, 3), "buf": int(self.buffer.size)}
+                    if "loss" in train_stats:
+                        postfix["loss"] = round(train_stats["loss"], 4)
+                    iterator.set_postfix(**postfix)
 
             if int(cfg.checkpoint_every_steps) > 0 and step % int(cfg.checkpoint_every_steps) == 0:
                 self._save_model(self.run_dir / "edgeq_model_latest.pt")

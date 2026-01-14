@@ -131,6 +131,7 @@ def build_stage_od(
         subset = base_od[
             (base_od["pickup_dist_center_m"] <= center_max)
             & (base_od["trip_dist_m"] <= short_max)
+            & (~base_od.get("structural_unreachable", pd.Series(False, index=base_od.index)).astype(bool))
         ]
         target = int(max(1, len(base_od) * float(stage.density_multiplier)))
         sampled = _weighted_sample(subset, target, rng)
@@ -148,13 +149,16 @@ def build_stage_od(
         short_max = quantiles["short_max"]
         edge_min = quantiles["edge_min"]
         long_min = quantiles["long_min"]
+        reachable_mask = ~base_od.get("structural_unreachable", pd.Series(False, index=base_od.index)).astype(bool)
         center_subset = base_od[
             (base_od["pickup_dist_center_m"] <= center_max)
             & (base_od["trip_dist_m"] <= short_max)
+            & reachable_mask
         ]
         edge_subset = base_od[
             (base_od["pickup_dist_center_m"] >= edge_min)
             & (base_od["trip_dist_m"] >= long_min)
+            & reachable_mask
         ]
         target = int(max(1, len(base_od) * float(stage.density_multiplier)))
         center_target = int(round(target * float(stage.center_ratio)))

@@ -965,12 +965,25 @@ class EventDrivenEnv:
             if vehicle is None:
                 self.done = True
                 return self._observe(), 0.0, True, {}
-        actions, mask = self.get_action_mask()
-        if action not in actions:
-            raise ValueError("Action not in neighbor set")
-        action_idx = actions.index(action)
-        if not mask[action_idx]:
-            raise ValueError("Action violates hard mask constraints")
+        
+        neighbor_actions = [dst for dst, _ in self.neighbors.get(vehicle.current_stop, [])]
+        if action not in neighbor_actions:
+            raise ValueError(f"Action {action} not in neighbor set for stop {vehicle.current_stop}")
+        
+        # Debug模式：验证动作是否违反mask约束
+        if self.config.debug_mask:
+            actions, mask = self.get_action_mask(debug=True)
+            try:
+                action_idx = actions.index(action)
+                if not mask[action_idx]:
+                    raise ValueError(
+                        f"Action violates hard mask constraints: action={action}, "
+                        f"mask_debug={self.last_mask_debug}"
+                    )
+            except ValueError as e:
+                if "not in list" in str(e):
+                    raise ValueError(f"Action {action} not in action list {actions}")
+                raise
 
         travel_time = dict(self.neighbors.get(vehicle.current_stop, [])).get(action)
         if travel_time is None:

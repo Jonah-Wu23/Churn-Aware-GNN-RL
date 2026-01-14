@@ -31,7 +31,7 @@ env:
   max_horizon_steps: 2000
   mask_alpha: 1.5
   walk_threshold_sec: 600
-  max_requests: 2000
+  max_requests: 1500
   seed: 7
   num_vehicles: 50
   vehicle_capacity: 6
@@ -47,7 +47,7 @@ env:
   reward_waiting_churn_penalty: 1.0
   reward_onboard_churn_penalty: 1.0
   reward_travel_cost_per_sec: 0.0
-  reward_tacc_weight: 1.0
+  reward_tacc_weight: 0.01
   reward_onboard_delay_weight: 0.1
   reward_cvar_penalty: 1.0
   reward_fairness_weight: 1.0
@@ -62,34 +62,35 @@ train:
   seed: 7
   total_steps: 200000
   buffer_size: 100000
-  batch_size: 256
+  batch_size: 128
   learning_starts: 5000
   train_freq: 4
   gradient_steps: 1
   target_update_interval: 2000
   gamma: 0.99
-  learning_rate: 0.0003
+  learning_rate: 0.0005
   max_grad_norm: 10.0
   double_dqn: true
   epsilon_start: 1.0
   epsilon_end: 0.05
   epsilon_decay_steps: 100000
-  log_every_steps: 1000
+  log_every_steps: 500
   checkpoint_every_steps: 10000
   device: cuda
+  use_amp: true
 
 model:
   node_dim: 5
   edge_dim: 4
-  hidden_dim: 128
-  num_layers: 4
-  dropout: 0.15
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.1
 
 eval:
   episodes: 5
   seed: 7
   policy: random
-  device: cpu
+  device: cuda
   max_steps: null
 
 embeddings:
@@ -123,7 +124,7 @@ sumo:
   stop_to_sumo_edge_path: "data/processed/graph/stop_to_sumo_edge.json"
 
 curriculum:
-  stages: [L0]
+  stages: [L0, L1, L2, L3]
   trigger_rho: 0.8
   gamma: 1.0
   stage_max_steps: 50000

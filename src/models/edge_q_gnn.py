@@ -9,37 +9,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 from torch import Tensor
-
-
-class EdgeConditionedConv(nn.Module):
-    """Edge-conditioned convolution (ECC / NNConv-style) in pure PyTorch."""
-
-    def __init__(self, in_dim: int, out_dim: int, edge_dim: int, activation: nn.Module | None = None) -> None:
-        super().__init__()
-        self.in_dim = int(in_dim)
-        self.out_dim = int(out_dim)
-        self.edge_dim = int(edge_dim)
-        self.activation = activation
-
-        self.root = nn.Linear(self.in_dim, self.out_dim)
-        self.edge_mlp = nn.Sequential(
-            nn.Linear(self.edge_dim, self.out_dim * self.in_dim),
-        )
-
-    def forward(self, x: Tensor, edge_index: Tensor, edge_attr: Tensor) -> Tensor:
-        if edge_index.numel() == 0:
-            out = self.root(x)
-            return self.activation(out) if self.activation is not None else out
-
-        src = edge_index[0].long()
-        dst = edge_index[1].long()
-        weights = self.edge_mlp(edge_attr).view(-1, self.out_dim, self.in_dim)
-        x_src = x[src].unsqueeze(-1)  # [E, in_dim, 1]
-        msg = torch.bmm(weights, x_src).squeeze(-1)  # [E, out_dim]
-
-        out = self.root(x)
-        out.index_add_(0, dst, msg)
-        return self.activation(out) if self.activation is not None else out
+from torch_geometric.nn import TransformerConv
 
 
 class EdgeQGNN(nn.Module):
@@ -64,11 +34,13 @@ class EdgeQGNN(nn.Module):
         )
         self.convs = nn.ModuleList(
             [
-                EdgeConditionedConv(
-                    in_dim=self.hidden_dim,
-                    out_dim=self.hidden_dim,
+                TransformerConv(
+                    in_channels=self.hidden_dim,
+                    out_channels=self.hidden_dim,
                     edge_dim=self.edge_dim,
-                    activation=nn.ReLU(),
+                    heads=1,
+                    concat=False,
+                    dropout=self.dropout,
                 )
                 for _ in range(self.num_layers)
             ]

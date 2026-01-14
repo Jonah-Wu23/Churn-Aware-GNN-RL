@@ -6,7 +6,10 @@ import argparse
 import json
 import logging
 import sys
+from functools import partial
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
+from typing import Dict, Tuple
 
 import pandas as pd
 
@@ -18,6 +21,27 @@ from src.data.od_mapping import MappingConfig, map_od_to_stops
 from src.utils.config import load_config
 
 
+def process_single_file(
+    path: Path,
+    stops_df: pd.DataFrame,
+    config: MappingConfig,
+    out_dir: Path,
+    bbox: Dict[str, float],
+) -> Dict:
+    """处理单个OD文件并返回审计信息。"""
+    try:
+        od_df = pd.read_parquet(path)
+        out_path = out_dir / path.name
+        _, audit = map_od_to_stops(od_df, stops_df, config, out_path, bbox)
+        audit["input_path"] = str(path)
+        audit["output_path"] = str(out_path)
+        logging.info(f"已完成处理: {path.name}")
+        return audit
+    except Exception as e:
+        logging.error(f"处理文件 {path} 时出错: {e}")
+        raise
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="Path to YAML config file", required=True)
@@ -25,6 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stops-path")
     parser.add_argument("--out-dir")
     parser.add_argument("--audit-path")
+    parser.add_argument("--n-jobs", type=int, default=-1, help="并行进程数,-1表示使用所有CPU核心")
     parser.add_argument("--log-level", default="INFO")
     return parser.parse_args()
 
@@ -55,14 +80,25 @@ def main() -> None:
     if not input_paths:
         raise SystemExit(f"No files match {input_glob}")
 
-    audits = []
-    for path in input_paths:
-        od_df = pd.read_parquet(path)
-        out_path = Path(out_dir) / path.name
-        _, audit = map_od_to_stops(od_df, stops_df, config, out_path, bbox)
-        audit["input_path"] = str(path)
-        audit["output_path"] = str(out_path)
-        audits.append(audit)
+    n_jobs = args.n_jobs if args.n_jobs > 0 else cpu_count()
+    logging.info(f"找到 {len(input_paths)} 个文件,使用 {n_jobs} 个进程并行处理")
+
+    out_dir_path = Path(out_dir)
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+
+    process_func = partial(
+        process_single_file,
+        stops_df=stops_df,
+        config=config,
+        out_dir=out_dir_path,
+        bbox=bbox,
+    )
+
+    if len(input_paths) == 1 or n_jobs == 1:
+        audits = [process_func(path) for path in input_paths]
+    else:
+        with Pool(processes=n_jobs) as pool:
+            audits = pool.map(process_func, input_paths)
 
     audit_path = Path(audit_path)
     audit_path.parent.mkdir(parents=True, exist_ok=True)

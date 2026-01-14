@@ -26,7 +26,7 @@ eval:
   episodes: 5
   seed: 7
   policy: random
-  device: cpu
+  device: cuda
   max_steps: null
 
 curriculum:
