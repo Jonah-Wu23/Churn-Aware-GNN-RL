@@ -274,7 +274,9 @@ def generate_stage(
     stage_od.to_parquet(od_path, index=False)
 
     env_overrides: Dict[str, float | int] = {
-        "max_requests": int(len(stage_od)),
+        # NOTE: Do NOT override max_requests here. Let the config file value apply.
+        # The curriculum generates a stage-specific OD file, and max_requests
+        # in the config controls how many records are loaded per episode.
     }
     if stage.churn_tol_override_sec is not None:
         env_overrides["churn_tol_sec"] = int(stage.churn_tol_override_sec)

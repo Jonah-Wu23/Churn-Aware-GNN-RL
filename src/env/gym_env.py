@@ -75,6 +75,9 @@ class EnvConfig:
     graph_nodes_path: str = "data/processed/graph/layer2_nodes.parquet"
     graph_edges_path: str = "data/processed/graph/layer2_edges.parquet"
     graph_embeddings_path: str = "data/processed/graph/node2vec_embeddings.parquet"
+    # Time-based train/eval split: "train" uses first ratio, "eval" uses rest, None disables
+    time_split_mode: Optional[str] = None  # "train", "eval", or None
+    time_split_ratio: float = 0.3  # fraction of time for training (default 30%)
 
     def __post_init__(self) -> None:
         if self.reward_churn_penalty is not None:
@@ -297,6 +300,24 @@ class EventDrivenEnv:
         if not required.issubset(set(od.columns)):
             raise ValueError("OD data must include pickup_stop_id/dropoff_stop_id/tpep_pickup_datetime")
         od = od.sort_values("tpep_pickup_datetime").reset_index(drop=True)
+        
+        # Time-based train/eval split
+        if self.config.time_split_mode is not None:
+            t_min = od["tpep_pickup_datetime"].min()
+            t_max = od["tpep_pickup_datetime"].max()
+            duration = (t_max - t_min).total_seconds()
+            cutoff_time = t_min + pd.Timedelta(seconds=duration * self.config.time_split_ratio)
+            
+            if self.config.time_split_mode == "train":
+                od = od[od["tpep_pickup_datetime"] <= cutoff_time].copy()
+                LOG.info(f"Time split [train]: using {len(od):,} records before {cutoff_time}")
+            elif self.config.time_split_mode == "eval":
+                od = od[od["tpep_pickup_datetime"] > cutoff_time].copy()
+                LOG.info(f"Time split [eval]: using {len(od):,} records after {cutoff_time}")
+            else:
+                raise ValueError(f"Invalid time_split_mode: {self.config.time_split_mode}")
+            od = od.reset_index(drop=True)
+        
         if self.config.max_requests:
             od = od.iloc[: self.config.max_requests].copy()
         t0 = od["tpep_pickup_datetime"].iloc[0]
@@ -842,7 +863,7 @@ class EventDrivenEnv:
                 idx = stop_index[stop_id]
                 node_features[idx, 0] = float(risk_mean)
                 node_features[idx, 1] = float(risk_cvar)
-                node_features[idx, 2] = float(count)
+                node_features[idx, 2] = float(min(count, 500.0))
                 node_features[idx, 3] = self.fairness_weight.get(int(stop_id), 1.0)
                 if int(stop_id) not in self.geo_embedding_scalar:
                     raise ValueError(f"Missing geo embedding for stop {stop_id}")
@@ -867,7 +888,7 @@ class EventDrivenEnv:
             idx = stop_index[stop_id]
             node_features[idx, 0] = float(risk_mean)
             node_features[idx, 1] = float(risk_cvar)
-            node_features[idx, 2] = float(count)
+            node_features[idx, 2] = float(min(count, 500.0))
             node_features[idx, 3] = self.fairness_weight.get(int(stop_id), 1.0)
             if int(stop_id) not in self.geo_embedding_scalar:
                 raise ValueError(f"Missing geo embedding for stop {stop_id}")
@@ -881,23 +902,37 @@ class EventDrivenEnv:
             onboard_risks_before: List[float] = []
             onboard_risks_after: List[float] = []
             count_violation = 0.0
+            
+            # Sanitization constants
+            MAX_TIME_VAL = 36000.0
+            
             for pax in vehicle.onboard:
                 curr_eta = self._shortest_time(vehicle.current_stop, pax["dropoff_stop_id"])
-                new_eta = travel_time + self._shortest_time(action, pax["dropoff_stop_id"])
+                new_eta_leg = self._shortest_time(action, pax["dropoff_stop_id"])
+                
+                # Handle infinite ETAs (unreachable traps)
+                if not np.isfinite(curr_eta): curr_eta = MAX_TIME_VAL
+                if not np.isfinite(new_eta_leg): new_eta_leg = MAX_TIME_VAL
+                
+                new_eta = travel_time + new_eta_leg
                 delta_eta_max = max(delta_eta_max, max(0.0, new_eta - curr_eta))
+                
                 delay_before = max(0.0, curr_eta - pax.get("direct_time_sec", curr_eta))
                 delay_after = max(0.0, new_eta - pax.get("direct_time_sec", new_eta))
+                
                 onboard_risks_before.append(self._onboard_churn_prob(delay_before))
                 onboard_risks_after.append(self._onboard_churn_prob(delay_after))
+                
                 if pax.get("pickup_time_sec") is not None:
                     eta_total = self.current_time + new_eta
                     if eta_total - pax["pickup_time_sec"] > pax["t_max_sec"]:
                         count_violation += 1.0
+            
             delta_cvar = self._cvar(onboard_risks_after) - self._cvar(onboard_risks_before)
-            edge_features[i, 0] = float(delta_eta_max)
+            edge_features[i, 0] = float(min(delta_eta_max, MAX_TIME_VAL))
             edge_features[i, 1] = float(delta_cvar)
-            edge_features[i, 2] = float(count_violation)
-            edge_features[i, 3] = float(travel_time)
+            edge_features[i, 2] = float(min(count_violation, 100.0))
+            edge_features[i, 3] = float(min(travel_time, MAX_TIME_VAL))
 
         full_batch = {
             "node_features": node_features,

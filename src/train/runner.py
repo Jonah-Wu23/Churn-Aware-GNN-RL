@@ -69,6 +69,8 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
             "data/processed/graph/node2vec_embeddings.parquet",
         ),
         travel_time_multiplier=float(env_cfg.get("travel_time_multiplier", 1.0)),
+        time_split_mode=env_cfg.get("time_split_mode"),
+        time_split_ratio=float(env_cfg.get("time_split_ratio", 0.3)),
     )
 
 

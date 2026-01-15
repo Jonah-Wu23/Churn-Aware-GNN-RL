@@ -384,6 +384,9 @@ class DQNTrainer:
                 self.scaler.update()
             else:
                 loss = F.smooth_l1_loss(q_preds_tensor, targets_tensor)
+                if torch.isnan(loss):
+                    LOG.warning(f"NaN loss detected at step {global_step}. Skipping optimization.")
+                    continue
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), float(cfg.max_grad_norm))
                 self.optimizer.step()

@@ -170,7 +170,7 @@
     - 95th percentile wait time via `wait_time_p95_sec`.
     - Fairness (Gini of stop service rate) via `service_gini`.
   - Acceptance: reproducible across seeds; outputs saved with config + seed + dataset hashes in `eval_results.json` (plus `eval_episodes.csv`).
-- [ ] Implement HCRide baseline.
+- [x] Implement HCRide baseline.
   - Acceptance: matches referenced HCRide rule/parameters; documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
 - [ ] Implement MAPPO baseline.
@@ -239,5 +239,6 @@ Goal: align runnable entrypoints with `docs/流失驱动的社区微公交动态
 - [x] Unit tests for churn sigmoid shape (waiting + onboard) with deterministic RNG.
 - [x] Unit tests for CVaR (`cvar_alpha=0.95`) with known distributions.
 - [x] Unit tests for hard mask correctness and debug output determinism.
-- [ ] Unit tests for passenger state machine (exactly-one-state invariant and valid transitions).
-- [ ] Integration test: fixed seed episode reproduces identical event trace + key metrics (multi-vehicle + capacity).
+- [x] Unit tests for passenger state machine (exactly-one-state invariant and valid transitions).
+- [x] Integration test: fixed seed episode reproduces identical event trace + key metrics (multi-vehicle + capacity).
+

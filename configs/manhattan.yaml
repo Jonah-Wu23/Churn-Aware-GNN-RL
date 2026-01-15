@@ -33,7 +33,7 @@ env:
   walk_threshold_sec: 600
   max_requests: 1500
   seed: 7
-  num_vehicles: 50
+  num_vehicles: 51
   vehicle_capacity: 6
   request_timeout_sec: 600
   debug_mask: true
@@ -57,6 +57,9 @@ env:
   graph_nodes_path: "data/processed/graph/layer2_nodes.parquet"
   graph_edges_path: "data/processed/graph/layer2_edges.parquet"
   graph_embeddings_path: "data/processed/graph/node2vec_embeddings.parquet"
+  # Time-based train/eval split: "train" uses first 30%, "eval" uses remaining 70%
+  time_split_mode: "train"   # Set to "train" or "eval" to enable split
+  time_split_ratio: 0.3
 
 train:
   seed: 7

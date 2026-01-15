@@ -303,6 +303,8 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
             "graph_embeddings_path",
             "data/processed/graph/node2vec_embeddings.parquet",
         ),
+        time_split_mode=env_cfg.get("time_split_mode"),
+        time_split_ratio=float(env_cfg.get("time_split_ratio", 0.3)),
     )
 
 
