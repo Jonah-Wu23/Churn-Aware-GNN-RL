@@ -173,21 +173,22 @@
 - [x] Implement HCRide baseline.
   - Acceptance: matches referenced HCRide rule/parameters; documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
-- [ ] Implement MAPPO baseline.
+- [x] Implement MAPPO baseline.
   - Acceptance: matches upstream MAPPO implementation/params (baselines/on-policy); documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
-- [ ] Implement safety-starter-agents baseline (CPO).
+- [x] Implement safety-starter-agents baseline (CPO).
   - Acceptance: matches upstream CPO implementation/params (safety-starter-agents); documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
-- [ ] Implement MOHITO (UAI 2025) baseline.
+- [x] Implement MOHITO (UAI 2025) baseline.
   - Acceptance: matches upstream MOHITO implementation/params (baselines/mohito-public, PettingZoo env integration); documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
-- [ ] Implement Wu et al. (C&IE 2024) multi-agent microtransit baseline.
+- [x] Implement Wu et al. (C&IE 2024) multi-agent microtransit baseline.
   - Acceptance: matches upstream implementation/params (baselines/transportation_sparse/Multi-Agent Deep Reinforcement Learning based Real-time Planning Approach for Responsive Customized Bus Routes); documented (English) with citations in `docs/` or `src/eval/README.md`.
   - Acceptance: produces evaluator metrics.
-- [ ] Ensure fairness metric definition is explicit and reproducible.
+- [x] Ensure fairness metric definition is explicit and reproducible.
   - Acceptance: define "stop service rate" denominator and stop set.
   - Acceptance: compute Gini reproducibly; include unit tests.
+  - **Done**: Unified Gini via `src/utils/fairness.py` (RMD algorithm), stop set = all Layer-2 stops (including zero-service), unit tests in `tests/test_fairness_gini.py`.
 
 ---
 
@@ -241,4 +242,192 @@ Goal: align runnable entrypoints with `docs/流失驱动的社区微公交动态
 - [x] Unit tests for hard mask correctness and debug output determinism.
 - [x] Unit tests for passenger state machine (exactly-one-state invariant and valid transitions).
 - [x] Integration test: fixed seed episode reproduces identical event trace + key metrics (multi-vehicle + capacity).
+
+---
+
+# L. Risk Mitigation for MOHITO and Wu2024 Baselines - Ensure Fair Comparison
+
+## Objective
+Eliminate reviewers' concerns about "apples-to-oranges" comparisons by ensuring MOHITO and Wu2024 baselines are trained under the same conditions as other baselines (MAPPO, CPO, HCRide). The goal is not to make them "win", but to ensure they learn the basic task so fairness metrics (Gini, service rate) are interpretable and comparable.
+
+## L1. Risk Points to Address
+- [ ] **Training Inconsistency**: Other baselines are in-domain trained, but MOHITO/Wu2024 may be zero-shot or random-init.
+  - Acceptance: Document current training status for MOHITO and Wu2024.
+  - Acceptance: Identify if they use pre-trained weights, random init, or zero-shot cross-domain inference.
+- [ ] **Domain Gap Impact on Fairness**: Models that fail to learn the task will have low service rates, leading to unstable or meaningless Gini coefficients.
+  - Acceptance: Verify that current MOHITO/Wu2024 results show reasonable service rates (not extremely low).
+  - Acceptance: If service rates are too low, flag this as a risk to fairness metric validity.
+
+## L2. Minimum Requirements for "Complete Risk Elimination"
+### 2.1 In-Domain Training
+- [ ] **Train both MOHITO and Wu2024 in the same domain** (Manhattan microtransit environment).
+  - Acceptance: Training uses the same `EventDrivenEnv` and `EnvConfig` as MAPPO/CPO/HCRide.
+  - Acceptance: Training mode is either:
+    - **Option 1 (Strongly Recommended)**: Train from scratch (random init) to convergence.
+    - **Option 2 (Also Acceptable)**: Fine-tune from pre-trained weights (e.g., rideshare domain) to convergence on our task.
+  - Acceptance: Document the chosen approach clearly in paper/README.
+
+### 2.2 Training Budget Alignment
+- [ ] **Use the same training budget** (env steps, episodes, or decision steps) for MOHITO/Wu2024 as for other baselines.
+  - Acceptance: Training budget is explicitly defined and documented in README or paper experimental setup.
+  - Acceptance: Training curves (service rate, churn rate) are logged and saved for verification.
+  - Acceptance: Convergence is defined as "service rate and churn rate stabilize on validation set" (not necessarily best performance).
+
+### 2.3 Unified Reward, Mask, and Episode Rules
+- [ ] **Ensure identical training conditions** across all baselines:
+  - Acceptance: Same reward function (no special fairness regularization for MOHITO/Wu2024).
+  - Acceptance: Same feasibility mask, capacity constraints, time windows, timeout rules.
+  - Acceptance: Same structural unreachability handling.
+  - Acceptance: Config files for MOHITO/Wu2024 training match other baselines in all critical parameters.
+
+### 2.4 Unified Data Split and Evaluation Protocol
+- [ ] **Use the same train/test split**:
+  - Acceptance: Training seeds (or training demand samples) are strictly separated from test seeds.
+  - Acceptance: Test seeds are fixed and identical across all baselines.
+- [ ] **Use the same evaluator**:
+  - Acceptance: All baselines (including MOHITO/Wu2024) are evaluated via the unified `src/eval/evaluator.py`.
+  - Acceptance: Same `_compute_metrics()` for all baselines.
+  - Acceptance: Metrics output format is identical (same JSON schema).
+
+## L3. Training Protocol (Strong Immunity - Required)
+- [ ] **Train MOHITO from scratch** in the Manhattan domain.
+  - Acceptance: Random initialization (no pre-trained weights).
+  - Acceptance: Train to convergence using the unified training protocol.
+  - Acceptance: Save training logs, curves, and final checkpoint.
+- [ ] **Train Wu2024 from scratch** in the Manhattan domain.
+  - Acceptance: Random initialization (same as MOHITO).
+  - Acceptance: Train to convergence using the unified training protocol.
+  - Acceptance: Save training logs, curves, and final checkpoint.
+- **Rationale**: This approach is the most transparent and least open to criticism. Both baselines must be trained from random initialization to convergence, ensuring complete comparability with MAPPO/CPO/HCRide.
+
+## L4. Unified Re-Training Protocol Template (Paper-Ready Checklist)
+### 4.1 Training Scenario Distribution
+- [ ] **Define training scenario mix**:
+  - Acceptance: Use "Normal" scenario as primary distribution.
+  - Acceptance: Optionally mix small amounts of curriculum scenarios (Bait/Surge) for robustness.
+  - Acceptance: Fixed mixing ratio across all baselines.
+  - Acceptance: Document scenario distribution in config and README.
+
+### 4.2 Training Budget
+- [ ] **Fix training budget** (same for all baselines):
+  - Acceptance: Define budget in terms of decision steps or episodes.
+  - Acceptance: Document budget in README/paper.
+  - Example: "All baselines trained for 1M decision steps" or "500 episodes".
+
+### 4.3 Randomness Control
+- [ ] **Use multiple training seeds**:
+  - Acceptance: At least 3 training seeds per baseline.
+  - Acceptance: Training seeds are distinct from test seeds.
+  - Acceptance: Document all seeds used.
+- [ ] **Fix test seeds**:
+  - Acceptance: All baselines evaluated on the same fixed set of test seeds.
+  - Acceptance: Test seeds never used during training.
+
+### 4.4 Hyperparameter Strategy
+- [ ] **Choose one hyperparameter approach**:
+  - **Option A (Most Stable)**: Small grid search (e.g., 2 learning rates × 2 entropy coefficients) applied equally to all baselines.
+    - Acceptance: All baselines use the same grid.
+    - Acceptance: Document grid search results.
+  - **Option B (Simpler)**: Use default hyperparameters from original papers + necessary scaling adjustments (e.g., normalization).
+    - Acceptance: Document all hyperparameters in config files.
+    - Acceptance: No per-baseline special tuning.
+- [ ] **Document chosen strategy** in README/paper.
+
+### 4.5 Convergence Criteria
+- [ ] **Define convergence** as "service rate and algorithmic churn rate stabilize on validation set":
+  - Acceptance: Not required to reach optimal performance, only to "learn the task".
+  - Acceptance: Training stops when metrics plateau for N consecutive validation checks.
+  - Acceptance: Document convergence criteria.
+
+### 4.6 Evidence Chain (Reproducibility)
+- [ ] **Save all training artifacts**:
+  - Acceptance: Config hash, seed, training curves, final checkpoint, git commit SHA.
+  - Acceptance: All artifacts saved in a structured run directory.
+  - Acceptance: Run directory includes `run_meta.json` with metadata.
+- [ ] **Make training reproducible**:
+  - Acceptance: Provide training script + config that can reproduce results.
+  - Acceptance: Document training commands in README.
+
+### 4.7 Final Reporting
+- [ ] **Report in-domain trained results** in main comparison table:
+  - Acceptance: Main table includes only in-domain trained MOHITO/Wu2024 results.
+  - Acceptance: Clearly label as "in-domain trained" or "trained to convergence".
+- [ ] **Optionally include zero-shot results** as supplementary:
+  - Acceptance: Add appendix row showing "zero-shot (pre-trained)" results as reference.
+  - Acceptance: This demonstrates transparency and will not reduce paper quality.
+
+## L5. Fairness Metric Immunity Patch (Strongly Recommended)
+- [ ] **Bundle key metrics together** in result tables to prevent "Gini meaningless at low service" criticism:
+  - Acceptance: For each baseline, report:
+    - `served` (or `total_boardings`)
+    - `service_rate`
+    - `service_gini`
+  - Acceptance: Ensure service volume is not "extremely low" before interpreting Gini.
+  - Acceptance: If service rate is very low, flag this in the table or text.
+- [ ] **Add validation check**:
+  - Acceptance: If `service_rate < threshold` (e.g., 30%), add a note that fairness metrics may be unstable.
+  - Acceptance: Document this threshold and rationale.
+
+## L6. Implementation Tasks
+### 6.1 MOHITO Training Integration
+- [ ] **Implement MOHITO training adapter**:
+  - Acceptance: Create `scripts/run_mohito_train.py` or integrate into unified training script.
+  - Acceptance: Adapter converts `EventDrivenEnv` observations to MOHITO input format.
+  - Acceptance: Training loop saves checkpoints compatible with evaluator.
+- [ ] **Run MOHITO training**:
+  - Acceptance: Train for defined budget to convergence.
+  - Acceptance: Save all artifacts (logs, curves, checkpoints).
+- [ ] **Validate MOHITO convergence**:
+  - Acceptance: Service rate stabilizes on validation set.
+  - Acceptance: Churn rate shows improvement trend.
+
+### 6.2 Wu2024 Training Integration
+- [ ] **Implement Wu2024 training adapter**:
+  - Acceptance: Create `scripts/run_wu2024_train.py` or integrate into unified training script.
+  - Acceptance: Adapter converts `EventDrivenEnv` observations to Wu2024 pointer-net input format.
+  - Acceptance: Training loop saves checkpoints compatible with evaluator.
+- [ ] **Run Wu2024 training**:
+  - Acceptance: Train for defined budget to convergence.
+  - Acceptance: Save all artifacts (logs, curves, checkpoints).
+- [ ] **Validate Wu2024 convergence**:
+  - Acceptance: Service rate stabilizes on validation set.
+  - Acceptance: Churn rate shows improvement trend.
+
+### 6.3 Unified Evaluation After Training
+- [ ] **Re-run evaluator with trained MOHITO/Wu2024**:
+  - Acceptance: Use `src/eval/evaluator.py` with `policy=mohito` and `policy=wu2024`.
+  - Acceptance: Load trained checkpoints (not random or zero-shot).
+  - Acceptance: Evaluate on fixed test seeds (same as other baselines).
+- [ ] **Verify metric comparability**:
+  - Acceptance: Service rates for all baselines are in reasonable range (e.g., >30%).
+  - Acceptance: Gini coefficients are stable (not degenerate due to low service).
+  - Acceptance: All metrics logged in same format.
+
+### 6.4 Documentation Updates
+- [ ] **Update README/paper experimental setup**:
+  - Acceptance: Document training protocol for MOHITO/Wu2024 (from-scratch or fine-tuned).
+  - Acceptance: Document training budget, seeds, hyperparameters.
+  - Acceptance: State clearly: "All baselines trained in-domain to convergence using unified protocol".
+- [ ] **Update baseline documentation**:
+  - Acceptance: `src/eval/README.md` includes training details for MOHITO/Wu2024.
+  - Acceptance: Include references to original papers + any modifications.
+- [ ] **Add training evidence**:
+  - Acceptance: Include training curves (service rate, churn rate) in supplementary materials or appendix.
+  - Acceptance: Reference run directories with saved artifacts.
+
+## L7. Acceptance Criteria for "Complete Risk Elimination"
+- [ ] **Final checklist**:
+  - [ ] MOHITO and Wu2024 are trained in-domain (Manhattan EventDrivenEnv) to convergence.
+  - [ ] Training uses the same reward, mask, episode rules, and budget as MAPPO/CPO/HCRide.
+  - [ ] Train/test seeds are strictly separated and identical across all baselines.
+  - [ ] All baselines evaluated via unified `src/eval/evaluator.py` producing identical metric schema.
+  - [ ] Service rates are reasonable (>30%) for all baselines, ensuring Gini interpretability.
+  - [ ] All training artifacts (configs, seeds, curves, checkpoints, git SHAs) are saved and reproducible.
+  - [ ] Documentation (README + paper) clearly states "in-domain trained" and provides full experimental protocol.
+  - [ ] Main comparison table shows only in-domain trained results; zero-shot results (if any) are in appendix as reference.
+
+## Summary Statement (For Paper/README)
+> **"MOHITO and Wu2024 baselines are trained in-domain to convergence using the same environment, reward function, training budget, and data split as other baselines (MAPPO, CPO, HCRide). All baselines are evaluated via a unified evaluator producing identical metrics, ensuring fair and interpretable comparison, especially for fairness (Gini) metrics."**
+
+---
 

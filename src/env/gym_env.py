@@ -14,6 +14,8 @@ import numpy as np
 import networkx as nx
 import pandas as pd
 
+from src.utils.fairness import gini_coefficient, compute_service_volume_gini
+
 
 def _haversine_meters(lon1: np.ndarray, lat1: np.ndarray, lon2: np.ndarray, lat2: np.ndarray) -> np.ndarray:
     rad = np.pi / 180.0
@@ -506,16 +508,11 @@ class EventDrivenEnv:
         return float(np.mean(tail)) if tail else 0.0
 
     def _gini(self, values: List[float]) -> float:
-        if not values:
-            return 0.0
-        arr = np.array(values, dtype=float)
-        if np.all(arr == 0):
-            return 0.0
-        diff_sum = np.abs(arr[:, None] - arr[None, :]).sum()
-        mean = float(np.mean(arr))
-        if mean == 0:
-            return 0.0
-        return float(diff_sum / (2 * len(arr) ** 2 * mean))
+        """Compute Gini coefficient using standardized algorithm.
+        
+        See src/utils/fairness.py for algorithm details and documentation.
+        """
+        return gini_coefficient(values)
 
     def _compute_waiting_risks(self) -> Dict[int, Tuple[float, float, int]]:
         risks: Dict[int, Tuple[float, float, int]] = {}
@@ -1104,7 +1101,10 @@ class EventDrivenEnv:
             info["event_trace_length"] = float(len(self.event_log))
             info["service_by_stop"] = dict(self.service_count_by_stop)
             info["dropoffs_by_stop"] = dict(self.dropoff_count_by_stop)
-            info["service_gini"] = float(self._gini(list(self.service_count_by_stop.values())))
+            # Use aligned vector (all Layer-2 stops) for reproducible cross-baseline Gini
+            info["service_gini"] = float(compute_service_volume_gini(
+                self.service_count_by_stop, self.stop_ids
+            ))
         if self.config.debug_mask:
             info["mask_debug"] = self.last_mask_debug
         return self._observe(), reward, self.done, info

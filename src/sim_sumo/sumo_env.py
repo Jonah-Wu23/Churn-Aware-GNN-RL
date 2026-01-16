@@ -18,6 +18,8 @@ import numpy as np
 import networkx as nx
 import pandas as pd
 
+from src.utils.fairness import gini_coefficient
+
 LOG = logging.getLogger(__name__)
 
 
@@ -482,17 +484,11 @@ class SUMOEnv:
         return float(np.mean(tail)) if tail else 0.0
     
     def _gini(self, values: List[float]) -> float:
-        """Compute Gini coefficient for fairness."""
-        if not values:
-            return 0.0
-        arr = np.array(values, dtype=float)
-        if np.all(arr == 0):
-            return 0.0
-        diff_sum = np.abs(arr[:, None] - arr[None, :]).sum()
-        mean = float(np.mean(arr))
-        if mean == 0:
-            return 0.0
-        return float(diff_sum / (2 * len(arr) ** 2 * mean))
+        """Compute Gini coefficient using standardized algorithm.
+        
+        See src/utils/fairness.py for algorithm details and documentation.
+        """
+        return gini_coefficient(values)
     
     def _compute_waiting_risks(self) -> Dict[int, Tuple[float, float, int]]:
         """Compute per-stop waiting risk metrics."""

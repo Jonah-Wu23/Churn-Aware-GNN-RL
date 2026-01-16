@@ -18,6 +18,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", default=None)
+    parser.add_argument("--start-stage", default=None)
+    parser.add_argument("--init-model-path", default=None)
     return parser.parse_args()
 
 
@@ -25,7 +27,12 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
     run_dir = Path(args.run_dir) if args.run_dir else None
-    log_path = run_curriculum_training(args.config, run_dir=run_dir)
+    log_path = run_curriculum_training(
+        args.config,
+        run_dir=run_dir,
+        start_stage=args.start_stage,
+        init_model_path=args.init_model_path,
+    )
     logging.info("Curriculum log written to %s", log_path)
 
 

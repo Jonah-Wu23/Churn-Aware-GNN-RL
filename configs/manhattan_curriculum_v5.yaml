@@ -28,7 +28,7 @@ mapping:
   walk_threshold_sec: 600
 
 env:
-  max_horizon_steps: 2000
+  max_horizon_steps: 6000
   mask_alpha: 1.5
   walk_threshold_sec: 600
   max_requests: 1500
@@ -40,17 +40,17 @@ env:
   churn_tol_sec: 300
   churn_beta: 0.02
   waiting_churn_tol_sec: 300
-  waiting_churn_beta: 0.02
+  waiting_churn_beta: 0.01
   onboard_churn_tol_sec: 300
-  onboard_churn_beta: 0.02
-  reward_service: 1.0
-  reward_waiting_churn_penalty: 1.0
-  reward_onboard_churn_penalty: 1.0
+  onboard_churn_beta: 0.01
+  reward_service: 3.0
+  reward_waiting_churn_penalty: 0.3
+  reward_onboard_churn_penalty: 0.5
   reward_travel_cost_per_sec: 0.0
   reward_tacc_weight: 0.01
   reward_onboard_delay_weight: 0.1
-  reward_cvar_penalty: 1.0
-  reward_fairness_weight: 1.0
+  reward_cvar_penalty: 0.5
+  reward_fairness_weight: 0.1
   cvar_alpha: 0.95
   fairness_gamma: 1.0
   od_glob: "data/processed/od_mapped/*.parquet"
@@ -95,31 +95,6 @@ eval:
   policy: random
   device: cuda
   max_steps: null
-  # HCRide baseline config
-  hcride:
-    alpha: 1.5
-    lagrange_lambda: 1.0
-    preference_threshold: 0.1
-    preference_radius_scale_m: 1000.0
-    empty_stop_penalty: 1000000.0
-  # MAPPO baseline config
-  mappo:
-    neighbor_k: 8
-    hidden_size: 64
-    recurrent_N: 1
-  # CPO baseline config
-  cpo:
-    neighbor_k: 8
-  # MOHITO baseline config (zero-shot, epsilon=0)
-  mohito:
-    feature_len: 5
-    num_layers_actor: 20
-    hidden_dim: 50
-    heads: 2
-    lr_actor: 0.001
-    beta: 0.001
-    grid_size: 10
-    epsilon: 0.0  # Fixed at 0 for deterministic eval
 
 embeddings:
   method: node2vec
@@ -167,6 +142,7 @@ curriculum:
       time_scale: 0.6
       center_quantile: 0.3
       short_trip_quantile: 0.3
+      churn_tol_override_sec: 600
     L2:
       density_multiplier: 1.2
       time_scale: 0.7
@@ -175,6 +151,7 @@ curriculum:
       short_trip_quantile: 0.3
       edge_quantile: 0.7
       long_trip_quantile: 0.7
+      churn_tol_override_sec: 900
     L3:
       density_multiplier: 1.0
       time_scale: 1.0

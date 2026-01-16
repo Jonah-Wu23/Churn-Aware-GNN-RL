@@ -20,6 +20,7 @@ import torch
 
 from src.models.edge_q_gnn import EdgeQGNN
 from src.utils.hashing import sha256_file
+from src.utils.fairness import compute_service_volume_gini
 
 from .sumo_env import SUMOEnv, SUMOEnvConfig
 from .traci_adapter import (
@@ -53,18 +54,7 @@ class SUMOEvalConfig:
     stop_to_sumo_edge_path: str = "data/processed/graph/stop_to_sumo_edge.json"
 
 
-def _gini(values: List[float]) -> float:
-    """Compute Gini coefficient."""
-    if not values:
-        return 0.0
-    arr = np.array(values, dtype=float)
-    if np.all(arr == 0):
-        return 0.0
-    arr = np.sort(arr)
-    n = len(arr)
-    cum = np.cumsum(arr)
-    gini = (n + 1 - 2 * np.sum(cum) / cum[-1]) / n
-    return float(gini)
+
 
 
 def _compute_wait_times(requests: List[dict]) -> List[float]:
@@ -101,7 +91,8 @@ def _compute_metrics(env: SUMOEnv, total_tacc: float) -> Dict[str, float]:
     wait_times = _compute_wait_times(env.requests)
     wait_p95 = float(np.percentile(wait_times, 95)) if wait_times else 0.0
     
-    gini = _gini([float(v) for v in env.service_count_by_stop.values()])
+    # Use aligned vector (all Layer-2 stops) for reproducible cross-baseline Gini
+    gini = compute_service_volume_gini(env.service_count_by_stop, env.stop_ids)
     
     return {
         "total_requests": total_requests,

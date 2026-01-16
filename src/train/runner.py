@@ -127,7 +127,12 @@ def _greedy_policy(features: Dict[str, np.ndarray]) -> Optional[int]:
     return int(actions[best_idx])
 
 
-def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = None) -> Path:
+def run_curriculum_training(
+    config_path: str | Path,
+    run_dir: Optional[Path] = None,
+    start_stage: Optional[str] = None,
+    init_model_path: Optional[str | Path] = None,
+) -> Path:
     cfg = load_config(config_path)
     env_cfg = cfg.get("env", {})
     curriculum_cfg = cfg.get("curriculum", {})
@@ -149,14 +154,17 @@ def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = N
     run_dir.mkdir(parents=True, exist_ok=True)
     curriculum_log = run_dir / "curriculum_log.jsonl"
     log_handle = curriculum_log.open("w", encoding="utf-8")
+    meta_payload = {
+        "type": "meta",
+        "config_path": str(config_path),
+        "curriculum": curriculum.__dict__,
+        "stages": [spec.__dict__ for spec in stage_specs],
+        "start_stage": start_stage,
+        "init_model_path": str(init_model_path) if init_model_path is not None else None,
+    }
     log_handle.write(
         json.dumps(
-            {
-                "type": "meta",
-                "config_path": str(config_path),
-                "curriculum": curriculum.__dict__,
-                "stages": [spec.__dict__ for spec in stage_specs],
-            },
+            meta_payload,
             ensure_ascii=False,
         )
         + "\n"
@@ -196,9 +204,29 @@ def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = N
     )
     model.to(torch.device(dqn_config.device))
 
-    active_specs = [spec for spec in stage_specs if spec.name in curriculum.stages]
-    current_stage_idx = 0
-    for spec in active_specs:
+    if init_model_path is not None:
+        init_path = Path(init_model_path)
+        if not init_path.exists():
+            raise FileNotFoundError(f"init_model_path does not exist: {init_path}")
+        state_dict = torch.load(init_path, map_location=torch.device(dqn_config.device))
+        model.load_state_dict(state_dict)
+        LOG.info("Loaded init model from %s", init_path)
+    elif start_stage is not None:
+        LOG.warning("start_stage=%s set without init_model_path; training will start from scratch.", start_stage)
+
+    all_specs = [spec for spec in stage_specs if spec.name in curriculum.stages]
+    if start_stage is not None:
+        stage_names = [spec.name for spec in all_specs]
+        if start_stage not in stage_names:
+            raise ValueError(f"start_stage {start_stage} not in active stages {stage_names}")
+        start_index = stage_names.index(start_stage)
+        run_specs = all_specs[start_index:]
+    else:
+        start_index = 0
+        run_specs = all_specs
+
+    for local_idx, spec in enumerate(run_specs):
+        current_stage_idx = start_index + local_idx
         stage_dir = run_dir / f"stage_{spec.name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
         stage_output = generate_stage(
@@ -253,7 +281,7 @@ def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = N
         transition = {
             "type": "stage_transition",
             "from_stage": spec.name,
-            "to_stage": active_specs[current_stage_idx + 1].name if current_stage_idx + 1 < len(active_specs) else None,
+            "to_stage": all_specs[current_stage_idx + 1].name if current_stage_idx + 1 < len(all_specs) else None,
             "stage_index": int(current_stage_idx),
             "episodes": int(episode_count),
             "last_rho": float(latest_rho),
@@ -261,7 +289,6 @@ def run_curriculum_training(config_path: str | Path, run_dir: Optional[Path] = N
         }
         log_handle.write(json.dumps(transition, ensure_ascii=False) + "\n")
         log_handle.flush()
-        current_stage_idx += 1
 
     log_handle.close()
     return curriculum_log
