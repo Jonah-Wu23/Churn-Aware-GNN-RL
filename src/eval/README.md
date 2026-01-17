@@ -158,60 +158,63 @@ Citations:
 
 MOHITO (Multi-Agent Reinforcement Learning using Hypergraphs for Task-Open Systems) from UAI 2025.
 
-**Important**: This is a **zero-shot cross-domain baseline**. The models are pretrained on the upstream rideshare domain and evaluated on our microtransit domain without retraining. This provides a baseline comparison point but does NOT represent a MOHITO agent trained on our domain.
+### Evaluation Modes
 
-Implementation summary:
-- Multi-vehicle parameter sharing: all vehicles share one actor network.
-- Minimal hypergraph adapter: constructs MOHITO-compatible graph from EventDrivenEnv features.
-- Heuristic feature mapping: our 5-dim node features mapped to MOHITO's schema.
-- Zero exploration: epsilon=0 for deterministic reproducibility.
+| Mode | Command | Description |
+|------|---------|-------------|
+| **In-Domain Trained** (Recommended) | `--model-path reports/mohito_train/*/mohito_actor_final.pth` | A2C trained from scratch on Manhattan domain |
+| Zero-Shot | `--model-path baselines/mohito-public/rideshare/.../policy_agent0.pth` | Pretrained on rideshare, cross-domain inference |
 
-Graph construction (minimal hypergraph):
-- Agent nodes: vehicle state (location, onboard count, accepted count)
-- Task nodes: waiting passengers at stops with non-empty queues
-- Action nodes: candidate destination stops
-- Edge nodes: hyperedge connectors linking agent-task-action
+### In-Domain Training (L2 Unified Protocol)
 
-Feature mapping (heuristic, not semantic equivalence):
+Trains MOHITO from random initialization using the same EventDrivenEnv and reward/mask as other baselines:
 
-| MOHITO Field | Our Mapping |
-|--------------|-------------|
-| node_type | Fixed constant per node category |
-| location | Stop index mod grid_size² |
-| accepted_count | Waiting queue length at stop |
-| riding_count | Onboard passenger count |
+```powershell
+# Full training (200k steps)
+python scripts/run_mohito_train.py --config configs/manhattan.yaml
 
-Config keys:
-- eval.policy: "mohito"
-- eval.model_path: path to trained actor.pth
-- eval.mohito.feature_len (default 5)
-- eval.mohito.num_layers_actor (default 20)
-- eval.mohito.hidden_dim (default 50)
-- eval.mohito.heads (default 2)
-- eval.mohito.grid_size (default 10)
-- eval.mohito.epsilon (default 0.0, fixed for deterministic eval)
-
-Evaluation:
-```bash
-python scripts/run_eval.py --config configs/manhattan.yaml \
-    --policy mohito --model-path baselines/mohito-public/rideshare/results/xxx/policy_agent0.pth
+# Smoke test (1k steps)
+python scripts/run_mohito_train.py --config configs/manhattan.yaml --total-steps 1000
 ```
 
-Upstream code structure (`baselines/mohito-public/rideshare/`):
-- `mohitoR/gat.py`: ActorNetwork and CriticNetwork with GAT layers
-- `mohitoR/trainer.py`: Training loop with MADDPG-style updates
-- `mohitoR/evaluator.py`: Evaluation script
-- `rideshare/ride.py`: Rideshare environment
+Training features:
+- **Algorithm**: A2C (Actor-Critic) with GAT-based actor + MLP critic
+- **Reward**: Same as MAPPO/CPO/EdgeQ (env.step() reward only, no custom shaping)
+- **Mask**: Hard mask from env.get_action_mask()
+- **Checkpoint schema**: Unified format (model_state_dict, config_hash, git_commit)
+- **Convergence**: service_rate stabilizes on eval split
 
-Note on pretrained models:
-- You can train your own models using the upstream trainer, or
-- Use the provided test episode checkpoints for zero-shot evaluation
+### Evaluation
 
-Citations:
+```powershell
+# With trained model
+python scripts/run_eval.py --config configs/manhattan.yaml \
+    --policy mohito --model-path reports/mohito_train/run_xxx/mohito_actor_final.pth
+```
+
+### Config Keys
+
+```yaml
+eval:
+  mohito:
+    feature_len: 5
+    num_layers_actor: 20
+    hidden_dim: 50
+    heads: 2
+    grid_size: 10
+    epsilon: 0.0
+
+mohito_train:
+  total_steps: 200000
+  learning_rate: 0.001
+  entropy_coef: 0.01
+```
+
+### Citations
+
 - Gayathri Anil, Prashant Doshi, Daniel Redder, Adam Eck, Leen-Kiat Soh.
   "MOHITO: Multi-Agent Reinforcement Learning using Hypergraphs for Task-Open Systems."
   UAI 2025. Local PDF: baselines/mohito-public/adresUAI25_cameraready.pdf
-- Official code: baselines/mohito-public (submodule)
 
 ---
 
@@ -219,72 +222,61 @@ Citations:
 
 Wu et al. "Multi-Agent Deep Reinforcement Learning based Real-time Planning Approach for Responsive Customized Bus Routes" from Computers & Industrial Engineering 2024.
 
-> [!CAUTION]
-> **CRITICAL DECLARATIONS (READ BEFORE USE)**
->
-> **1. Weight Status (pretrained=false):**
-> The baseline repository contains NO pretrained `.pt` files. This implementation uses `random_init` or `uniform_logits` mode. Results do NOT represent the paper's method performance ceiling.
->
-> **2. Domain Transfer:**
-> EventDrivenEnv uses dynamic k-hop subgraph; original paper uses fixed station topology. This is heuristic mapping (Strategy S1), not retrained.
->
-> **3. Reproducibility:**
-> All randomness controlled by seed. Evaluation JSON records: `seed`, `config_hash`, `weights_mode`.
+### Evaluation Modes
 
-### Implementation Summary
+| Mode | Command | Description |
+|------|---------|-------------|
+| **In-Domain Trained** (Recommended) | `--model-path reports/wu2024_train/*/wu2024_model_final.pt` | A2C trained from scratch on Manhattan domain |
+| Random Init | `weights_mode: random_init`, no model_path | Xavier-initialized weights |
+| Uniform | `weights_mode: uniform_logits` | Select first valid action |
 
-This is an **architecture placeholder baseline** for unified evaluator alignment:
+### In-Domain Training (L2 Unified Protocol)
 
-- **Core Architecture**: PointerNetwork with 1D-Conv encoder + GRU + Attention decoder
-- **Strategy S1**: Fixed Kmax candidates + padding (constant input dimension)
-- **V0 Features**: Minimal closed-loop (coordinates, travel_time, waiting_count, load, time)
-- **Multi-Agent**: Parameter sharing (single model for all vehicles)
+Trains Wu2024 from random initialization using the same EventDrivenEnv and reward/mask as other baselines:
 
-### Candidate Selection (Strategy S1)
+```powershell
+# Full training (200k steps)
+python scripts/run_wu2024_train.py --config configs/manhattan.yaml
 
-Each decision step:
-1. Get candidate actions from env (filtered by action_mask)
-2. Sort by travel time (ascending)
-3. Take first Kmax candidates; pad with dummy if fewer
-4. Apply mask: dummy and infeasible positions = 0
+# Smoke test (1k steps)
+python scripts/run_wu2024_train.py --config configs/manhattan.yaml --total-steps 1000
+```
+
+Training features:
+- **Algorithm**: A2C with PointerNet actor + shared-encoder MLP critic
+- **Mask**: Hard logits mask (invalid actions = -inf, entropy only over valid)
+- **Reward**: Same as MAPPO/CPO/EdgeQ (env.step() reward only)
+- **Checkpoint schema**: Unified format (model_state_dict, config_hash, git_commit)
+- **Convergence**: service_rate stabilizes on eval split
+
+### Evaluation
+
+```powershell
+# With trained model
+python scripts/run_eval.py --config configs/manhattan.yaml \
+    --policy wu2024 --model-path reports/wu2024_train/run_xxx/wu2024_model_final.pt
+```
 
 ### Config Keys
 
 ```yaml
 eval:
-  policy: "wu2024"
-  model_path: ""  # Optional, leave empty for random_init
   wu2024:
-    kmax: 64          # Max candidates per decision (default 64)
-    weights_mode: "random_init"  # "random_init" or "uniform_logits"
-    hidden_size: 128  # GRU hidden size (default 128)
-    num_layers: 1     # GRU layers (default 1)
-    dropout: 0.1      # Dropout rate (default 0.1)
+    kmax: 32
+    hidden_size: 128
+    weights_mode: "trained"  # "trained", "random_init", or "uniform_logits"
+
+wu2024_train:
+  total_steps: 200000
+  learning_rate: 0.0005
+  entropy_coef: 0.01
 ```
 
-### Weights Mode
+### Architecture
 
-| Mode | Description |
-|------|-------------|
-| `random_init` | Use model forward pass with Xavier-initialized weights |
-| `uniform_logits` | Skip model, select first valid action (deterministic) |
-
-### Evaluation
-
-```powershell
-python scripts/run_eval.py --config configs/manhattan.yaml --policy wu2024 --episodes 5
-```
-
-### Hyperparameters (from paper)
-
-| Parameter | Value | Source |
-|-----------|-------|--------|
-| hidden_size | 128 | Section 4.2 |
-| num_layers | 1 | Section 4.2 |
-| dropout | 0.1 | Section 4.2 |
-| actor_lr | 5e-4 | Table 2 |
-| batch_size | 128 | Table 2 |
-| max_load | 40 | Section 4.1 |
+- **Core**: PointerNetwork with 1D-Conv encoder + GRU + Attention decoder
+- **Strategy S1**: Fixed Kmax candidates + padding (constant input dimension)
+- **V0 Features**: coordinates, travel_time, waiting_count, load, time
 
 ### Citations
 
@@ -296,9 +288,9 @@ python scripts/run_eval.py --config configs/manhattan.yaml --policy wu2024 --epi
   journal={Computers \& Industrial Engineering},
   year={2024},
   volume={186},
-  pages={109764},
-  publisher={Elsevier}
+  pages={109764}
 }
 ```
 
-Local PDF: `baselines/transportation_sparse/Multi-Agent Deep Reinforcement Learning.../1-s2.0-S0360835223008641-main.pdf`
+Local PDF: `baselines/transportation_sparse/.../1-s2.0-S0360835223008641-main.pdf`
+
