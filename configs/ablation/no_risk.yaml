@@ -1,0 +1,78 @@
+# 消融实验2: w/o Risk-Awareness
+# 同时消融 Reward 和 Feature 层的风险信号
+
+ablation:
+  type: no_risk
+  description: "平均值优化，禁用 CVaR 和公平性"
+
+# 继承基础配置
+_base_: ../manhattan_curriculum_v10.yaml
+
+# 使用原始 EdgeQGNN 模型
+model:
+  type: edge_q_gnn
+  node_dim: 5
+  edge_dim: 4
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.1
+
+# 环境配置：禁用风险惩罚
+env:
+  # Reward 层消融
+  reward_cvar_penalty: 0.0
+  reward_fairness_weight: 0.0
+  # Feature 层消融由 RiskAblatedEnv 处理
+  # fairness_gamma: 0.0  # 会被 RiskAblatedEnv 覆盖
+  
+  # 其他参数与基线保持一致
+  max_horizon_steps: 6000
+  mask_alpha: 1.5
+  walk_threshold_sec: 600
+  max_requests: 1500
+  seed: 7
+  num_vehicles: 51
+  vehicle_capacity: 6
+  request_timeout_sec: 600
+  churn_tol_sec: 300
+  churn_beta: 0.02
+  waiting_churn_tol_sec: 300
+  waiting_churn_beta: 0.01
+  onboard_churn_tol_sec: 300
+  onboard_churn_beta: 0.01
+  reward_service: 3.0
+  reward_waiting_churn_penalty: 0.3
+  reward_onboard_churn_penalty: 0.5
+  reward_travel_cost_per_sec: 0.0
+  reward_tacc_weight: 0.01
+  reward_onboard_delay_weight: 0.1
+  cvar_alpha: 0.95
+
+# 训练配置与基线保持一致
+train:
+  seed: 7
+  total_steps: 200000
+  buffer_size: 100000
+  batch_size: 128
+  learning_starts: 5000
+  train_freq: 4
+  gradient_steps: 1
+  target_update_interval: 2000
+  gamma: 0.99
+  learning_rate: 0.0005
+  max_grad_norm: 10.0
+  double_dqn: true
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_steps: 100000
+  log_every_steps: 500
+  checkpoint_every_steps: 10000
+  device: cuda
+
+# 课程学习与基线保持一致
+curriculum:
+  stages: [L0, L1, L2, L3]
+  trigger_rho: 0.8
+  gamma: 1.0
+  stage_max_steps: 50000
+  stage_min_episodes: 3

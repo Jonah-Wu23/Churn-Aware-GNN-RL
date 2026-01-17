@@ -1,0 +1,48 @@
+# 消融实验1: w/o Edge-Encoding
+# 使用 NodeOnlyGNN (GAT)，移除边特征
+
+ablation:
+  type: no_edge
+  description: "Node-Only GNN, 移除边特征决策"
+
+# 继承基础配置
+_base_: ../manhattan_curriculum_v10.yaml
+
+# 模型配置：使用 NodeOnlyGNN
+model:
+  type: node_only_gnn
+  node_dim: 5
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.1
+  heads: 4
+  # 无 edge_dim
+
+# 训练配置与基线保持一致
+train:
+  seed: 7
+  total_steps: 200000
+  buffer_size: 100000
+  batch_size: 128
+  learning_starts: 5000
+  train_freq: 4
+  gradient_steps: 1
+  target_update_interval: 2000
+  gamma: 0.99
+  learning_rate: 0.0005
+  max_grad_norm: 10.0
+  double_dqn: true
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_steps: 100000
+  log_every_steps: 500
+  checkpoint_every_steps: 10000
+  device: cuda
+
+# 课程学习与基线保持一致
+curriculum:
+  stages: [L0, L1, L2, L3]
+  trigger_rho: 0.8
+  gamma: 1.0
+  stage_max_steps: 50000
+  stage_min_episodes: 3
