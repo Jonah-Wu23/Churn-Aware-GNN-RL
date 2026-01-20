@@ -122,7 +122,10 @@ def _run_single_training(cfg: Dict[str, Any], run_dir: Path) -> Path:
     model.to(torch.device(dqn_config.device))
 
     graph_hashes, od_hashes = build_hashes(env_cfg)
-    trainer = DQNTrainer(env=env, model=model, config=dqn_config, run_dir=run_dir, graph_hashes=graph_hashes, od_hashes=od_hashes)
+    trainer = DQNTrainer(
+        env=env, model=model, config=dqn_config, run_dir=run_dir,
+        graph_hashes=graph_hashes, od_hashes=od_hashes, env_cfg=env_cfg,
+    )
     log_path = trainer.train()
     trainer.close()
     return log_path

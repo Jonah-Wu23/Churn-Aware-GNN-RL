@@ -500,6 +500,7 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         reward_onboard_delay_weight=float(env_cfg.get("reward_onboard_delay_weight", 0.1)),
         reward_cvar_penalty=float(env_cfg.get("reward_cvar_penalty", 1.0)),
         reward_fairness_weight=float(env_cfg.get("reward_fairness_weight", 1.0)),
+        reward_congestion_penalty=float(env_cfg.get("reward_congestion_penalty", 0.0)),
         cvar_alpha=float(env_cfg.get("cvar_alpha", 0.95)),
         fairness_gamma=float(env_cfg.get("fairness_gamma", 1.0)),
         travel_time_multiplier=float(env_cfg.get("travel_time_multiplier", 1.0)),
@@ -517,6 +518,8 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         use_fleet_potential=bool(env_cfg.get("use_fleet_potential", False)),
         fleet_potential_mode=str(env_cfg.get("fleet_potential_mode", "next_stop")),
         fleet_potential_k=int(env_cfg.get("fleet_potential_k", 1)),
+        fleet_potential_hybrid_center_weight=float(env_cfg.get("fleet_potential_hybrid_center_weight", 0.5)),
+        fleet_potential_hybrid_neighbor_weight=float(env_cfg.get("fleet_potential_hybrid_neighbor_weight", 0.5)),
         fleet_potential_phi=str(env_cfg.get("fleet_potential_phi", "log1p_norm")),
     )
 
@@ -563,6 +566,7 @@ def evaluate(config: Dict[str, Any], config_path: str | Path, run_dir: Optional[
             hidden_dim=int(model_cfg.get("hidden_dim", 32)),
             num_layers=int(model_cfg.get("num_layers", 2)),
             dropout=float(model_cfg.get("dropout", 0.0)),
+            dueling=bool(model_cfg.get("dueling", False)),
         )
         
         # Load checkpoint and validate edge_dim compatibility

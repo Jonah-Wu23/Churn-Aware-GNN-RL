@@ -70,6 +70,7 @@ class EnvConfig:
     reward_cvar_penalty: float = 1.0
     reward_fairness_weight: float = 1.0
     reward_terminal_backlog_penalty: float = 0.0  # Normalized terminal backlog penalty
+    reward_congestion_penalty: float = 0.0
     cvar_alpha: float = 0.95
     fairness_gamma: float = 1.0
     travel_time_multiplier: float = 1.0
@@ -83,8 +84,10 @@ class EnvConfig:
     time_split_ratio: float = 0.3  # fraction of time for training (default 30%)
     # Fleet-Aware Edge Potential (FAEP) - default disabled for backward compatibility
     use_fleet_potential: bool = False
-    fleet_potential_mode: str = "next_stop"  # Options: "next_stop", "k_hop"
+    fleet_potential_mode: str = "next_stop"  # Options: "next_stop", "k_hop", "hybrid"
     fleet_potential_k: int = 1  # Only used when mode="k_hop"
+    fleet_potential_hybrid_center_weight: float = 0.5
+    fleet_potential_hybrid_neighbor_weight: float = 0.5
     fleet_potential_phi: str = "log1p_norm"  # Options: "log1p_norm", "linear_norm"
 
     def __post_init__(self) -> None:
@@ -422,6 +425,9 @@ class EventDrivenEnv:
             VehicleState(vehicle_id=idx, current_stop=int(self.rng.choice(self.stop_ids)))
             for idx in range(self.config.num_vehicles)
         ]
+        self._last_fleet_density_map: Dict[int, float] = {}
+        self._fleet_density_max_history: List[float] = []
+        self._visited_stops = {int(vehicle.current_stop) for vehicle in self.vehicles}
         self.event_queue: List[Tuple[float, int, int, str, dict]] = []
         self.event_seq = 0
         self.event_log: List[dict] = []
@@ -551,35 +557,101 @@ class EventDrivenEnv:
         Modes:
         - "next_stop": C(u) = #vehicles whose next_target_stop == u
         - "k_hop": Spreads density to k-hop neighborhood
+        - "hybrid": Center weight + k-hop neighbor diffusion
         
-        Boundary case: Vehicles waiting for decision count at current_stop.
+        Vehicle state handling:
+        - available_time <= current_time: waiting for decision at current_stop
+        - available_time > current_time: in transit (current_stop stores destination)
         
         Returns:
             Dict mapping stop_id -> density count (raw, not normalized)
         """
         density: Dict[int, float] = {int(stop_id): 0.0 for stop_id in self.stop_ids}
-        
+
+        waiting_targets: List[int] = []
+        in_transit_targets: List[int] = []
         for vehicle in self.vehicles:
-            # Determine next_target_stop based on vehicle state
-            # Boundary case: waiting vehicles count at current_stop
             if vehicle.available_time <= self.current_time:
-                # Vehicle is waiting for decision -> use current_stop
-                target_stop = int(vehicle.current_stop)
+                waiting_targets.append(int(vehicle.current_stop))
             else:
-                # Vehicle is in transit -> use current_stop (already set to destination)
-                target_stop = int(vehicle.current_stop)
-            
-            if self.config.fleet_potential_mode == "k_hop":
-                # Spread density to k-hop neighborhood
+                in_transit_targets.append(int(vehicle.current_stop))
+
+        mode = str(self.config.fleet_potential_mode)
+        center_weight = float(self.config.fleet_potential_hybrid_center_weight)
+        neighbor_weight = float(self.config.fleet_potential_hybrid_neighbor_weight)
+
+        def _apply_target(target_stop: int) -> None:
+            if mode == "k_hop":
                 neighbors = self._k_hop_neighbor_cache.get(target_stop, [target_stop])
                 spread_value = 1.0 / max(1, len(neighbors))
                 for neighbor in neighbors:
                     density[int(neighbor)] = density.get(int(neighbor), 0.0) + spread_value
-            else:
-                # "next_stop" mode: count at target only
-                density[target_stop] = density.get(target_stop, 0.0) + 1.0
-        
+                return
+            if mode == "hybrid":
+                density[target_stop] = density.get(target_stop, 0.0) + center_weight
+                if neighbor_weight <= 0.0:
+                    return
+                neighbors = self._k_hop_neighbor_cache.get(target_stop, [target_stop])
+                neighbor_nodes = [int(neighbor) for neighbor in neighbors if int(neighbor) != target_stop]
+                if not neighbor_nodes:
+                    return
+                spread_value = neighbor_weight / len(neighbor_nodes)
+                for neighbor in neighbor_nodes:
+                    density[int(neighbor)] = density.get(int(neighbor), 0.0) + spread_value
+                return
+            density[target_stop] = density.get(target_stop, 0.0) + 1.0
+
+        for target_stop in waiting_targets:
+            _apply_target(target_stop)
+        for target_stop in in_transit_targets:
+            _apply_target(target_stop)
+
         return density
+
+    def _refresh_fleet_density_map(self, record_history: bool = False) -> Dict[int, float]:
+        if not (self.config.use_fleet_potential or self.config.reward_congestion_penalty > 0.0):
+            self._last_fleet_density_map = {}
+            return {}
+        density_map = self._compute_fleet_density_by_stop()
+        self._last_fleet_density_map = density_map
+        if record_history:
+            density_values = list(density_map.values())
+            density_max = float(max(density_values)) if density_values else 0.0
+            self._fleet_density_max_history.append(density_max)
+        return density_map
+
+    def _append_fleet_density_summary(self, info: Dict[str, float]) -> None:
+        if not self.config.use_fleet_potential:
+            return
+        density_map = getattr(self, "_last_fleet_density_map", {})
+        if density_map:
+            density_values = list(density_map.values())
+            info["fleet_density_summary"] = {
+                "max": float(max(density_values)) if density_values else 0.0,
+                "mean": float(sum(density_values) / len(density_values)) if density_values else 0.0,
+                "top_5_congested_stops": [
+                    (int(stop_id), float(density))
+                    for stop_id, density in sorted(
+                        density_map.items(), key=lambda x: x[1], reverse=True
+                    )[:5]
+                ],
+            }
+        else:
+            info["fleet_density_summary"] = {"max": 0.0, "mean": 0.0, "top_5_congested_stops": []}
+
+    def _append_episode_density_metrics(self, info: Dict[str, float]) -> None:
+        history = self._fleet_density_max_history
+        if history:
+            info["fleet_density_max_mean"] = float(np.mean(history))
+            info["fleet_density_max_p95"] = float(np.percentile(history, 95))
+        else:
+            info["fleet_density_max_mean"] = 0.0
+            info["fleet_density_max_p95"] = 0.0
+        total_stops = len(self.stop_ids)
+        if total_stops > 0:
+            info["stop_coverage_ratio"] = float(len(self._visited_stops) / total_stops)
+        else:
+            info["stop_coverage_ratio"] = 0.0
     
     def _apply_fleet_potential_phi(self, density: float) -> float:
         """Apply normalization function phi to density value.
@@ -593,11 +665,12 @@ class EventDrivenEnv:
         num_vehicles = max(1, self.config.num_vehicles)
         
         if self.config.fleet_potential_phi == "linear_norm":
-            return float(density / num_vehicles)
+            value = float(density / num_vehicles)
         else:
             # Default: log1p_norm
             # phi(C) = log(1 + C) / log(1 + num_vehicles)
-            return float(np.log1p(density) / np.log1p(num_vehicles))
+            value = float(np.log1p(density) / np.log1p(num_vehicles))
+        return float(min(1.0, max(0.0, value)))
 
     def _schedule_event(self, time_sec: float, event_type: str, payload: dict) -> None:
         priority = EVENT_PRIORITY.get(event_type, 99)
@@ -733,6 +806,7 @@ class EventDrivenEnv:
         vehicle.visit_counts[int(vehicle.current_stop)] = (
             vehicle.visit_counts.get(int(vehicle.current_stop), 0) + 1
         )
+        self._visited_stops.add(int(vehicle.current_stop))
         dropped = [p for p in vehicle.onboard if p["dropoff_stop_id"] == vehicle.current_stop]
         kept = [p for p in vehicle.onboard if p["dropoff_stop_id"] != vehicle.current_stop]
         vehicle.onboard = kept
@@ -973,9 +1047,7 @@ class EventDrivenEnv:
         # Compute fleet density if FAEP enabled
         fleet_density_map: Dict[int, float] = {}
         if self.config.use_fleet_potential:
-            fleet_density_map = self._compute_fleet_density_by_stop()
-            # Store for logging in step()
-            self._last_fleet_density_map = fleet_density_map
+            fleet_density_map = self._refresh_fleet_density_map(record_history=False)
         for i, action in enumerate(actions):
             travel_time = dict(self.neighbors.get(vehicle.current_stop, [])).get(action, 0.0)
             delta_eta_max = 0.0
@@ -1088,6 +1160,8 @@ class EventDrivenEnv:
             self._advance_until_ready()
             vehicle = self._get_active_vehicle()
             if vehicle is None:
+                if self.config.use_fleet_potential or self.config.reward_congestion_penalty > 0.0:
+                    self._refresh_fleet_density_map(record_history=True)
                 self.done = True
                 # Populate info for early-return path
                 waiting_remaining = float(sum(len(q) for q in self.waiting.values()))
@@ -1097,9 +1171,17 @@ class EventDrivenEnv:
                     "waiting_remaining": waiting_remaining,
                     "onboard_remaining": onboard_remaining,
                     "waiting_timeouts": float(self.waiting_timeouts),
+                    "reward_congestion_penalty": 0.0,
+                    "dst_density_raw": 0.0,
+                    "fleet_potential_dst": 0.0,
                 }
+                self._append_fleet_density_summary(info)
+                self._append_episode_density_metrics(info)
                 return self._observe(), 0.0, True, info
         
+        if self.config.use_fleet_potential or self.config.reward_congestion_penalty > 0.0:
+            self._refresh_fleet_density_map(record_history=True)
+
         neighbor_actions = [dst for dst, _ in self.neighbors.get(vehicle.current_stop, [])]
         if action not in neighbor_actions:
             raise ValueError(f"Action {action} not in neighbor set for stop {vehicle.current_stop}")
@@ -1151,6 +1233,15 @@ class EventDrivenEnv:
         reward_onboard_churn = self.config.reward_onboard_churn_penalty * self._step_stats["onboard_churn_prob_sum"]
         reward_tacc = self.config.reward_tacc_weight * self._step_stats["tacc_gain"]
 
+        dst_density_raw = 0.0
+        fleet_potential_dst = 0.0
+        reward_congestion = 0.0
+        if self.config.use_fleet_potential or self.config.reward_congestion_penalty > 0.0:
+            density_map = getattr(self, "_last_fleet_density_map", {})
+            dst_density_raw = float(density_map.get(int(action), 0.0))
+            fleet_potential_dst = float(self._apply_fleet_potential_phi(dst_density_raw))
+            reward_congestion = float(self.config.reward_congestion_penalty * fleet_potential_dst)
+
         reward = (
             reward_base_service
             - reward_waiting_churn
@@ -1161,6 +1252,7 @@ class EventDrivenEnv:
             - reward_onboard_churn
             + reward_tacc
         )
+        reward -= reward_congestion
         if self.steps >= self.config.max_horizon_steps:
             self.done = True
 
@@ -1195,7 +1287,10 @@ class EventDrivenEnv:
             "reward_travel_cost": float(reward_travel_cost),
             "reward_onboard_delay_penalty": float(reward_onboard_delay),
             "reward_onboard_churn_penalty": float(reward_onboard_churn),
+            "reward_congestion_penalty": float(reward_congestion),
             "reward_tacc_bonus": float(reward_tacc),
+            "dst_density_raw": float(dst_density_raw),
+            "fleet_potential_dst": float(fleet_potential_dst),
             "reward_total": float(reward),
         }
         
@@ -1230,27 +1325,12 @@ class EventDrivenEnv:
             info["service_gini"] = float(compute_service_volume_gini(
                 self.service_count_by_stop, self.stop_ids
             ))
+            self._append_episode_density_metrics(info)
         if self.config.debug_mask:
             info["mask_debug"] = self.last_mask_debug
         
         # Fleet density summary (FAEP logging - required when enabled)
-        if self.config.use_fleet_potential:
-            density_map = getattr(self, "_last_fleet_density_map", {})
-            if density_map:
-                density_values = list(density_map.values())
-                # Convert to native Python types for JSON serialization
-                info["fleet_density_summary"] = {
-                    "max": float(max(density_values)) if density_values else 0.0,
-                    "mean": float(sum(density_values) / len(density_values)) if density_values else 0.0,
-                    "top_5_congested_stops": [
-                        (int(stop_id), float(density))
-                        for stop_id, density in sorted(
-                            density_map.items(), key=lambda x: x[1], reverse=True
-                        )[:5]
-                    ],
-                }
-            else:
-                info["fleet_density_summary"] = {"max": 0.0, "mean": 0.0, "top_5_congested_stops": []}
+        self._append_fleet_density_summary(info)
         
         return self._observe(), reward, self.done, info
 

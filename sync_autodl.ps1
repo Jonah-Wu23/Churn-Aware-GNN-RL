@@ -1,7 +1,10 @@
 $projectRoot = "d:\Documents\Bus Project\Mini Bus"
 $uploadDir = Join-Path $projectRoot "autodl_upload"
+$projectRootFull = [System.IO.Path]::GetFullPath($projectRoot)
+$uploadDirFull = [System.IO.Path]::GetFullPath($uploadDir)
 
 $syncPaths = @(
+    @{Source="per"; Include=@("*.py", "*.md", "LICENSE"); Exclude=@("__pycache__")},
     @{Source="src"; Include=@("*.py"); Exclude=@("__pycache__")},
     @{Source="scripts"; Include=@("*.py"); Exclude=@("__pycache__")},
     @{Source="configs"; Include=@("*.yaml"); Exclude=@()},
@@ -17,6 +20,7 @@ Write-Host "Starting sync to autodl_upload..." -ForegroundColor Cyan
 
 foreach ($pathConfig in $syncPaths) {
     $sourcePath = Join-Path $projectRoot $pathConfig.Source
+    $sourcePathFull = [System.IO.Path]::GetFullPath($sourcePath)
     
     if (-not (Test-Path $sourcePath)) {
         continue
@@ -24,7 +28,10 @@ foreach ($pathConfig in $syncPaths) {
     
     $sourceFiles = Get-ChildItem -Path $sourcePath -Recurse -File | Where-Object {
         $file = $_
-        $relativePath = $file.FullName.Substring($sourcePath.Length + 1)
+        if ($file.FullName.StartsWith($uploadDirFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        $relativePath = $file.FullName.Substring($sourcePathFull.Length + 1)
         
         $matchInclude = $false
         foreach ($pattern in $pathConfig.Include) {
@@ -46,7 +53,7 @@ foreach ($pathConfig in $syncPaths) {
     }
     
     foreach ($sourceFile in $sourceFiles) {
-        $relativePath = $sourceFile.FullName.Substring($projectRoot.Length + 1)
+        $relativePath = $sourceFile.FullName.Substring($projectRootFull.Length + 1)
         $targetFile = Join-Path $uploadDir $relativePath
         
         $needCopy = $false
@@ -92,7 +99,8 @@ if (Test-Path $zipPath) {
     Remove-Item $zipPath -Force
 }
 
-Compress-Archive -Path $uploadDir -DestinationPath $zipPath -Force
+$zipItems = Get-ChildItem -Path $uploadDir -Force | Where-Object { $_.Name -ne "autodl_upload" }
+Compress-Archive -Path $zipItems.FullName -DestinationPath $zipPath -Force
 Write-Host "Created: autodl_upload.zip" -ForegroundColor Green
 
 $zipSize = (Get-Item $zipPath).Length / 1MB

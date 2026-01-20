@@ -20,6 +20,7 @@ class EdgeQGNN(nn.Module):
         hidden_dim: int,
         num_layers: int = 2,
         dropout: float = 0.0,
+        dueling: bool = False,
     ) -> None:
         super().__init__()
         self.node_dim = node_dim
@@ -27,6 +28,7 @@ class EdgeQGNN(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = int(num_layers)
         self.dropout = float(dropout)
+        self.dueling = bool(dueling)
 
         self.node_encoder = nn.Sequential(
             nn.Linear(self.node_dim, self.hidden_dim),
@@ -51,6 +53,13 @@ class EdgeQGNN(nn.Module):
             nn.Dropout(p=self.dropout),
             nn.Linear(self.hidden_dim, 1),
         )
+        if self.dueling:
+            self.value_head = nn.Sequential(
+                nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(p=self.dropout),
+                nn.Linear(self.hidden_dim, 1),
+            )
 
     def forward(self, data):
         """Return edge Q values aligned with candidate action edges.
@@ -77,4 +86,14 @@ class EdgeQGNN(nn.Module):
         src = action_edge_index[0].long()
         dst = action_edge_index[1].long()
         features = torch.cat([h[src], h[dst], action_edge_attr], dim=-1)
-        return self.q_head(features).squeeze(-1)
+        advantage = self.q_head(features).squeeze(-1)
+        if not self.dueling:
+            return advantage
+        if action_edge_index.numel() == 0:
+            return advantage
+        current_node = int(action_edge_index[0, 0].item())
+        pooled = h.mean(dim=0)
+        value_input = torch.cat([h[current_node], pooled], dim=-1)
+        value = self.value_head(value_input).squeeze(-1)
+        adv_mean = advantage.mean()
+        return value + (advantage - adv_mean)

@@ -481,6 +481,7 @@ def evaluate_sumo(
             hidden_dim=int(model_cfg.get("hidden_dim", 32)),
             num_layers=int(model_cfg.get("num_layers", 2)),
             dropout=float(model_cfg.get("dropout", 0.0)),
+            dueling=bool(model_cfg.get("dueling", False)),
         )
         model.load_state_dict(torch.load(eval_config.model_path, map_location=device))
         model.to(device)

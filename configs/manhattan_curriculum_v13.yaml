@@ -51,6 +51,7 @@ env:
   reward_onboard_delay_weight: 0.1
   reward_cvar_penalty: 0.5
   reward_fairness_weight: 0.1
+  reward_congestion_penalty: 0.0
   cvar_alpha: 0.95
   fairness_gamma: 1.0
   od_glob: "data/processed/od_mapped/*.parquet"
@@ -63,8 +64,10 @@ env:
 
   # Fleet-Aware Edge Potential (FAEP) - default disabled for backward compatibility
   use_fleet_potential: true
-  fleet_potential_mode: "next_stop"  # Options: "next_stop", "k_hop"
+  fleet_potential_mode: "hybrid"  # Options: "next_stop", "k_hop", "hybrid"
   fleet_potential_k: 1               # Only used when mode="k_hop"
+  fleet_potential_hybrid_center_weight: 0.5
+  fleet_potential_hybrid_neighbor_weight: 0.5
   fleet_potential_phi: "log1p_norm"  # Options: "log1p_norm", "linear_norm"
 
 train:
@@ -76,6 +79,7 @@ train:
   train_freq: 4
   gradient_steps: 1
   target_update_interval: 2000
+  target_update_tau: 0.005
   gamma: 0.99
   learning_rate: 0.0005
   max_grad_norm: 10.0
@@ -83,6 +87,11 @@ train:
   epsilon_start: 1.0
   epsilon_end: 0.15
   epsilon_decay_steps: 500000
+  prioritized_replay: true
+  replay_alpha: 0.6
+  replay_beta_start: 0.4
+  replay_beta_frames: 200000
+  replay_eps: 0.000001
   log_every_steps: 500
   checkpoint_every_steps: 10000
   device: cuda
@@ -94,6 +103,7 @@ model:
   hidden_dim: 256
   num_layers: 3
   dropout: 0.1
+  dueling: true
 
 eval:
   episodes: 5
@@ -195,6 +205,25 @@ curriculum:
     - reward_fairness_weight
     - reward_cvar_penalty
     - reward_terminal_backlog_penalty
+    - reward_congestion_penalty
+  
+  epsilon_by_stage:
+    L0:
+      start: 0.3
+      end: 0.1
+      decay_steps: 50000
+    L1:
+      start: 0.2
+      end: 0.05
+      decay_steps: 50000
+    L2:
+      start: 0.1
+      end: 0.01
+      decay_steps: 50000
+    L3:
+      start: 0.05
+      end: 0.001
+      decay_steps: 50000
   
   l3_two_stage:
     enabled: true
@@ -204,6 +233,8 @@ curriculum:
       enabled: true
       steps: 10000
       log_every: 500
+      teacher_congestion_weight: 0.5
+      teacher_coverage_weight: 0.3
     phase1_env_overrides:
       reward_service: 6.0
       reward_waiting_churn_penalty: 0.1
@@ -229,6 +260,8 @@ curriculum:
       sample_fraction: 0.1
       time_scale: 2.0
       churn_tol_override_sec: 1000000000
+      env_overrides:
+        reward_congestion_penalty: 0.0
     L1:
       density_multiplier: 1.2
       time_scale: 0.8
@@ -238,6 +271,7 @@ curriculum:
       env_overrides:
         reward_waiting_churn_penalty: 2.0
         reward_terminal_backlog_penalty: 30.0
+        reward_congestion_penalty: 0.05
         max_horizon_steps: 8000
     L2:
       density_multiplier: 1.2
@@ -248,10 +282,14 @@ curriculum:
       edge_quantile: 0.7
       long_trip_quantile: 0.7
       churn_tol_override_sec: 900
+      env_overrides:
+        reward_congestion_penalty: 0.10
     L3:
       density_multiplier: 1.0
       time_scale: 1.0
       churn_tol_override_sec: 900
+      env_overrides:
+        reward_congestion_penalty: 0.20
 
 # MOHITO in-domain training config (L2 unified protocol)
 mohito_train:

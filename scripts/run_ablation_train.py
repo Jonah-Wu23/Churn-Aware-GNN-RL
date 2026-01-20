@@ -233,6 +233,7 @@ def main() -> None:
             run_dir=run_dir,
             graph_hashes=graph_hashes,
             od_hashes=od_hashes,
+            env_cfg=env_cfg,
         )
         log_path = trainer.train()
         trainer.close()

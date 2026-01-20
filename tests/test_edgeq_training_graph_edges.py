@@ -83,7 +83,7 @@ def test_dqn_passes_graph_edges_to_model(tmp_path):
         checkpoint_every_steps=0,
         device="cpu",
     )
-    trainer = DQNTrainer(env=env, model=model, config=cfg, run_dir=tmp_path, graph_hashes={}, od_hashes={})
+    trainer = DQNTrainer(env=env, model=model, config=cfg, run_dir=tmp_path, graph_hashes={}, od_hashes={}, env_cfg={})
     trainer.train(total_steps=1)
     trainer.close()
     assert model.forward_calls > 0

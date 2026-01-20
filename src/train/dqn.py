@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 import random
 
 import numpy as np
@@ -15,7 +15,7 @@ from torch import nn
 import copy
 from torch.nn import functional as F
 
-from src.train.replay_buffer import BufferSpec, ReplayBuffer
+from src.train.replay_buffer import BufferSpec, ReplayBuffer, PrioritizedReplayBuffer
 from src.utils.hashing import sha256_file
 
 LOG = logging.getLogger(__name__)
@@ -48,6 +48,7 @@ class DQNConfig:
     train_freq: int = 1
     gradient_steps: int = 1
     target_update_interval: int = 2_000
+    target_update_tau: float = 0.0
     gamma: float = 0.99
     learning_rate: float = 1e-3
     max_grad_norm: float = 10.0
@@ -59,12 +60,29 @@ class DQNConfig:
     checkpoint_every_steps: int = 10_000
     device: str = "cpu"
     use_amp: bool = False
+    prioritized_replay: bool = False
+    replay_alpha: float = 0.6
+    replay_beta_start: float = 0.4
+    replay_beta_frames: int = 200_000
+    replay_eps: float = 1e-6
+
+
+@dataclass(frozen=True)
+class EpsilonSchedule:
+    start: float
+    end: float
+    decay_steps: int
+    start_global_step: int
 
 
 def _linear_schedule(start: float, end: float, duration: int, t: int) -> float:
     if duration <= 0:
         return float(end)
-    frac = min(max(float(t) / float(duration), 0.0), 1.0)
+    if t <= 0:
+        return float(start)
+    if t >= duration:
+        return float(end)
+    frac = float(t) / float(duration)
     return float(start + frac * (end - start))
 
 
@@ -104,6 +122,7 @@ class DQNTrainer:
 
         # Global step as the single source of truth for epsilon
         self.global_step = int(global_step_init)
+        self._epsilon_schedule: Optional[EpsilonSchedule] = None
         
         # Epsilon cap support for collapse protection
         self.epsilon_cap: Optional[float] = None
@@ -115,7 +134,17 @@ class DQNTrainer:
             edge_dim=int(model.edge_dim),
             max_actions=int(max(len(v) for v in env.neighbors.values())) if env.neighbors else 0,
         )
-        self.buffer = ReplayBuffer(capacity=int(config.buffer_size), spec=spec)
+        if config.prioritized_replay:
+            self.buffer = PrioritizedReplayBuffer(
+                capacity=int(config.buffer_size),
+                spec=spec,
+                alpha=float(config.replay_alpha),
+                beta_start=float(config.replay_beta_start),
+                beta_frames=int(config.replay_beta_frames),
+                epsilon=float(config.replay_eps),
+            )
+        else:
+            self.buffer = ReplayBuffer(capacity=int(config.buffer_size), spec=spec)
 
         self.graph_edge_index = torch.tensor(env.graph_edge_index, dtype=torch.long, device=self.device)
         self.graph_edge_features = torch.tensor(env.graph_edge_features, dtype=torch.float32, device=self.device)
@@ -193,15 +222,50 @@ class DQNTrainer:
         if getattr(self, "_reward_log_handle", None):
             self._reward_log_handle.close()
 
+    def set_epsilon_schedule(
+        self,
+        start: float,
+        end: float,
+        decay_steps: int,
+        start_global_step: Optional[int] = None,
+    ) -> None:
+        self._epsilon_schedule = EpsilonSchedule(
+            start=float(start),
+            end=float(end),
+            decay_steps=int(decay_steps),
+            start_global_step=int(self.global_step if start_global_step is None else start_global_step),
+        )
+
     def get_epsilon(self) -> float:
         """获取当前epsilon值（考虑cap限制）"""
-        eps = _linear_schedule(
-            self.config.epsilon_start, self.config.epsilon_end,
-            self.config.epsilon_decay_steps, self.global_step
-        )
+        schedule = self._epsilon_schedule
+        if schedule is None:
+            eps = _linear_schedule(
+                self.config.epsilon_start,
+                self.config.epsilon_end,
+                self.config.epsilon_decay_steps,
+                self.global_step,
+            )
+        else:
+            local_step = max(0, int(self.global_step - schedule.start_global_step))
+            eps = _linear_schedule(
+                schedule.start,
+                schedule.end,
+                schedule.decay_steps,
+                local_step,
+            )
         if self.epsilon_cap is not None and self.epsilon_cap_remaining > 0:
             eps = min(eps, self.epsilon_cap)
         return eps
+
+    def _soft_update_target(self, tau: float) -> None:
+        tau = float(tau)
+        if tau <= 0.0:
+            return
+        with torch.no_grad():
+            for target_param, param in zip(self.target_model.parameters(), self.model.parameters()):
+                target_param.data.mul_(1.0 - tau)
+                target_param.data.add_(tau * param.data)
 
     def _get_rng_states(self) -> Dict[str, object]:
         """获取所有RNG状态用于checkpoint"""
@@ -384,7 +448,13 @@ class DQNTrainer:
         edge_attr = torch.tensor(action_edge, dtype=torch.float32, device=self.device)
         
         features = torch.cat([h[src], h[dst], edge_attr], dim=-1)
-        return active_model.q_head(features).squeeze(-1)
+        advantage = active_model.q_head(features).squeeze(-1)
+        if not getattr(active_model, "dueling", False):
+            return advantage
+        pooled = h.mean(dim=0)
+        value_input = torch.cat([h[int(obs_idx)], pooled], dim=-1)
+        value = active_model.value_head(value_input).squeeze(-1)
+        return value + (advantage - advantage.mean())
 
     def _optimize(self, global_step: int) -> Dict[str, float]:
         """优化步骤，GNN只做1次前向传播，批量计算所有样本Q值。"""
@@ -396,7 +466,14 @@ class DQNTrainer:
 
         losses = []
         for _ in range(int(cfg.gradient_steps)):
-            batch = self.buffer.sample(int(cfg.batch_size), rng=self.rng)
+            if cfg.prioritized_replay:
+                batch = self.buffer.sample(int(cfg.batch_size), rng=self.rng)
+                batch_weights = batch.get("weights")
+                batch_indices = batch.get("indices")
+            else:
+                batch = self.buffer.sample(int(cfg.batch_size), rng=self.rng)
+                batch_weights = None
+                batch_indices = None
             
             # 过滤掉无效样本（action_count=0）
             valid_mask = batch["action_count"] > 0
@@ -408,6 +485,8 @@ class DQNTrainer:
             # 批量计算当前状态Q值（每个样本obs不同，需逐个GNN前向）
             all_q_preds = []
             all_targets = []
+            td_errors: List[float] = []
+            priority_indices: List[int] = []
             
             for i in valid_indices:
                 a_count = int(batch["action_count"][i])
@@ -482,6 +561,9 @@ class DQNTrainer:
                 
                 target = float(batch["reward"][i]) + float(cfg.gamma) * (1.0 - float(batch["done"][i])) * q_next_val
                 all_targets.append(target)
+                td_errors.append(float(target - float(q_pred.detach().item())))
+                if batch_indices is not None:
+                    priority_indices.append(int(batch_indices[i]))
             
             if len(all_q_preds) == 0:
                 continue
@@ -490,17 +572,25 @@ class DQNTrainer:
             self.optimizer.zero_grad()
             q_preds_tensor = torch.stack(all_q_preds)
             targets_tensor = torch.tensor(all_targets, dtype=torch.float32, device=self.device)
+            if batch_weights is not None:
+                weights_tensor = torch.tensor(
+                    batch_weights[valid_indices], dtype=torch.float32, device=self.device
+                )
+            else:
+                weights_tensor = None
             
             if self.scaler is not None:
                 with torch.cuda.amp.autocast():
-                    loss = F.smooth_l1_loss(q_preds_tensor, targets_tensor)
+                    loss_vec = F.smooth_l1_loss(q_preds_tensor, targets_tensor, reduction="none")
+                    loss = loss_vec.mean() if weights_tensor is None else (loss_vec * weights_tensor).mean()
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), float(cfg.max_grad_norm))
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                loss = F.smooth_l1_loss(q_preds_tensor, targets_tensor)
+                loss_vec = F.smooth_l1_loss(q_preds_tensor, targets_tensor, reduction="none")
+                loss = loss_vec.mean() if weights_tensor is None else (loss_vec * weights_tensor).mean()
                 if torch.isnan(loss):
                     LOG.warning(f"NaN loss detected at step {global_step}. Skipping optimization.")
                     continue
@@ -509,8 +599,12 @@ class DQNTrainer:
                 self.optimizer.step()
             
             losses.append(float(loss.item()))
+            if cfg.prioritized_replay and priority_indices:
+                self.buffer.update_priorities(priority_indices, td_errors)
+            if float(cfg.target_update_tau) > 0.0:
+                self._soft_update_target(float(cfg.target_update_tau))
 
-        if global_step % int(cfg.target_update_interval) == 0:
+        if float(cfg.target_update_tau) <= 0.0 and global_step % int(cfg.target_update_interval) == 0:
             self.target_model.load_state_dict(self.model.state_dict())
 
         if not losses:
@@ -521,6 +615,7 @@ class DQNTrainer:
         self,
         total_steps: Optional[int] = None,
         episode_callback: Optional[Callable[[Dict[str, float]], bool]] = None,
+        step_callback: Optional[Callable[[int, int, object], None]] = None,
     ) -> Path:
         cfg = self.config
         max_steps = int(total_steps if total_steps is not None else cfg.total_steps)
@@ -555,6 +650,9 @@ class DQNTrainer:
                 if self.epsilon_cap_remaining == 0:
                     self.epsilon_cap = None
                     LOG.info("Epsilon cap expired at global_step=%d", self.global_step)
+
+            if step_callback is not None:
+                step_callback(self.global_step, int(step), self.env)
             
             features = self.env.get_feature_batch()
             mask = features["action_mask"].astype(bool)
@@ -565,10 +663,26 @@ class DQNTrainer:
                 actions = features["actions"].astype(np.int64)
                 valid = np.where(mask)[0]
                 if len(actions) == 0 or len(valid) == 0:
-                    reward = 0.0
+                    # 无有效动作 - 施加终止惩罚（关键修复）
+                    terminal_penalty, waiting_rem, onboard_rem, waiting_timeouts = (
+                        self._compute_terminal_backlog_penalty()
+                    )
+                    reward = -terminal_penalty  # 负惩罚作为 reward
                     done = True
-                    info = dict(self._fallback_episode_info())
                     stepped = False
+                    
+                    # 构建完整 info
+                    info = dict(self._fallback_episode_info())
+                    info["done_reason"] = "no_valid_action"
+                    info["terminal_backlog_penalty_applied"] = float(terminal_penalty)
+                    info["waiting_remaining"] = float(waiting_rem)
+                    info["onboard_remaining"] = float(onboard_rem)
+                    info["waiting_timeouts"] = float(waiting_timeouts)
+                    
+                    # 【关键】即使 stepped=False，也必须将惩罚计入 episode_return
+                    episode_return += float(reward)
+                    # 更新 last_info 确保 episode log 包含完整字段
+                    last_info = dict(info)
                 else:
                     action = int(actions[int(valid[0])])
                     _, reward, done, info = self.env.step(int(action))
@@ -595,7 +709,10 @@ class DQNTrainer:
                     "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
                     "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
                     "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
+                    "reward_congestion_penalty": float(info.get("reward_congestion_penalty", 0.0)),
                     "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
+                    "dst_density_raw": float(info.get("dst_density_raw", 0.0)),
+                    "fleet_potential_dst": float(info.get("fleet_potential_dst", 0.0)),
                     "step_travel_time_sec": float(info.get("step_travel_time_sec", 0.0)),
                     "step_stuckness": float(step_stuckness),
                 }
@@ -655,8 +772,12 @@ class DQNTrainer:
                     "waiting_timeouts": int(info.get("waiting_timeouts", 0)),
                     "waiting_remaining": int(info.get("waiting_remaining", 0)),
                     "onboard_remaining": int(info.get("onboard_remaining", 0)),
-                    "done_reason": info.get("done_reason", "unknown"),
+                    "done_reason": info.get("done_reason") or ("no_valid_action" if not stepped and done else "unknown"),
+                    "terminal_backlog_penalty_applied": float(info.get("terminal_backlog_penalty_applied", 0.0)),
                     "stuckness": float(stuck_sum / max(1, episode_steps)),
+                    "fleet_density_max_mean": float(info.get("fleet_density_max_mean", 0.0)),
+                    "fleet_density_max_p95": float(info.get("fleet_density_max_p95", 0.0)),
+                    "stop_coverage_ratio": float(info.get("stop_coverage_ratio", 0.0)),
                     "replay_size": self.buffer.size,
                 }
                 
