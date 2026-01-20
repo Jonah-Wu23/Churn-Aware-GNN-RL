@@ -140,3 +140,45 @@ class ReplayBuffer:
             "next_action_count": self.next_action_count[idx],
         }
 
+    def get_state(self) -> Dict[str, object]:
+        """获取buffer完整状态用于checkpoint保存"""
+        return {
+            "_size": self._size,
+            "_pos": self._pos,
+            "obs": self.obs[:self._size].copy() if self._size > 0 else np.array([]),
+            "obs_idx": self.obs_idx[:self._size].copy() if self._size > 0 else np.array([]),
+            "action_nodes": self.action_nodes[:self._size].copy() if self._size > 0 else np.array([]),
+            "action_edge": self.action_edge[:self._size].copy() if self._size > 0 else np.array([]),
+            "action_mask": self.action_mask[:self._size].copy() if self._size > 0 else np.array([]),
+            "action_count": self.action_count[:self._size].copy() if self._size > 0 else np.array([]),
+            "action_taken": self.action_taken[:self._size].copy() if self._size > 0 else np.array([]),
+            "reward": self.reward[:self._size].copy() if self._size > 0 else np.array([]),
+            "done": self.done[:self._size].copy() if self._size > 0 else np.array([]),
+            "next_obs": self.next_obs[:self._size].copy() if self._size > 0 else np.array([]),
+            "next_obs_idx": self.next_obs_idx[:self._size].copy() if self._size > 0 else np.array([]),
+            "next_action_nodes": self.next_action_nodes[:self._size].copy() if self._size > 0 else np.array([]),
+            "next_action_edge": self.next_action_edge[:self._size].copy() if self._size > 0 else np.array([]),
+            "next_action_mask": self.next_action_mask[:self._size].copy() if self._size > 0 else np.array([]),
+            "next_action_count": self.next_action_count[:self._size].copy() if self._size > 0 else np.array([]),
+        }
+
+    def set_state(self, state: Dict[str, object]) -> None:
+        """从checkpoint恢复buffer状态"""
+        self._size = int(state["_size"])
+        self._pos = int(state["_pos"])
+        if self._size > 0:
+            self.obs[:self._size] = state["obs"]
+            self.obs_idx[:self._size] = state["obs_idx"]
+            self.action_nodes[:self._size] = state["action_nodes"]
+            self.action_edge[:self._size] = state["action_edge"]
+            self.action_mask[:self._size] = state["action_mask"]
+            self.action_count[:self._size] = state["action_count"]
+            self.action_taken[:self._size] = state["action_taken"]
+            self.reward[:self._size] = state["reward"]
+            self.done[:self._size] = state["done"]
+            self.next_obs[:self._size] = state["next_obs"]
+            self.next_obs_idx[:self._size] = state["next_obs_idx"]
+            self.next_action_nodes[:self._size] = state["next_action_nodes"]
+            self.next_action_edge[:self._size] = state["next_action_edge"]
+            self.next_action_mask[:self._size] = state["next_action_mask"]
+            self.next_action_count[:self._size] = state["next_action_count"]

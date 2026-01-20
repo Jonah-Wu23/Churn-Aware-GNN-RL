@@ -69,6 +69,7 @@ class EnvConfig:
     reward_onboard_delay_weight: float = 0.1
     reward_cvar_penalty: float = 1.0
     reward_fairness_weight: float = 1.0
+    reward_terminal_backlog_penalty: float = 0.0  # Normalized terminal backlog penalty
     cvar_alpha: float = 0.95
     fairness_gamma: float = 1.0
     travel_time_multiplier: float = 1.0
@@ -80,6 +81,11 @@ class EnvConfig:
     # Time-based train/eval split: "train" uses first ratio, "eval" uses rest, None disables
     time_split_mode: Optional[str] = None  # "train", "eval", or None
     time_split_ratio: float = 0.3  # fraction of time for training (default 30%)
+    # Fleet-Aware Edge Potential (FAEP) - default disabled for backward compatibility
+    use_fleet_potential: bool = False
+    fleet_potential_mode: str = "next_stop"  # Options: "next_stop", "k_hop"
+    fleet_potential_k: int = 1  # Only used when mode="k_hop"
+    fleet_potential_phi: str = "log1p_norm"  # Options: "log1p_norm", "linear_norm"
 
     def __post_init__(self) -> None:
         if self.reward_churn_penalty is not None:
@@ -112,6 +118,7 @@ class EventDrivenEnv:
         self.config = config
         self.rng = np.random.default_rng(config.seed)
         self._load_graph()
+        self._precompute_k_hop_neighbors()  # Precompute for k_hop mode
         self._load_requests()
         self.reset()
 
@@ -138,7 +145,8 @@ class EventDrivenEnv:
         src_idx = edges["source"].map(self.stop_index).astype(int).to_numpy()
         dst_idx = edges["target"].map(self.stop_index).astype(int).to_numpy()
         self.graph_edge_index = np.stack([src_idx, dst_idx], axis=0).astype(np.int64)
-        graph_edge_features = np.zeros((len(edges), 4), dtype=np.float32)
+        edge_dim = 5 if self.config.use_fleet_potential else 4
+        graph_edge_features = np.zeros((len(edges), edge_dim), dtype=np.float32)
         graph_edge_features[:, 3] = edges["travel_time_sec"].to_numpy(dtype=np.float32)
         self.graph_edge_features = graph_edge_features
         if "lon" in nodes.columns and "lat" in nodes.columns:
@@ -176,6 +184,16 @@ class EventDrivenEnv:
         isolated = [stop_id for stop_id in self.stop_ids if stop_id not in self.neighbors]
         if isolated:
             LOG.warning("Layer 2 graph has %d stop(s) with no outgoing edges", len(isolated))
+
+    def _precompute_k_hop_neighbors(self) -> None:
+        """Precompute k-hop neighborhood for each stop (used by k_hop mode).
+        
+        This is called once during __init__ to avoid BFS in get_feature_batch.
+        """
+        k = max(1, self.config.fleet_potential_k)
+        self._k_hop_neighbor_cache: Dict[int, List[int]] = {}
+        for stop_id in self.stop_ids:
+            self._k_hop_neighbor_cache[int(stop_id)] = self._k_hop_nodes(int(stop_id), k)
 
     def _build_shortest_time_cache(self) -> None:
         n = len(self.stop_ids)
@@ -525,6 +543,62 @@ class EventDrivenEnv:
             risks[int(stop_id)] = (float(np.mean(probs)), self._cvar(probs), len(queue))
         return risks
 
+    def _compute_fleet_density_by_stop(self) -> Dict[int, float]:
+        """Compute fleet density C(u) for each stop.
+        
+        Uses stop_id as the canonical key (Indexing Contract).
+        
+        Modes:
+        - "next_stop": C(u) = #vehicles whose next_target_stop == u
+        - "k_hop": Spreads density to k-hop neighborhood
+        
+        Boundary case: Vehicles waiting for decision count at current_stop.
+        
+        Returns:
+            Dict mapping stop_id -> density count (raw, not normalized)
+        """
+        density: Dict[int, float] = {int(stop_id): 0.0 for stop_id in self.stop_ids}
+        
+        for vehicle in self.vehicles:
+            # Determine next_target_stop based on vehicle state
+            # Boundary case: waiting vehicles count at current_stop
+            if vehicle.available_time <= self.current_time:
+                # Vehicle is waiting for decision -> use current_stop
+                target_stop = int(vehicle.current_stop)
+            else:
+                # Vehicle is in transit -> use current_stop (already set to destination)
+                target_stop = int(vehicle.current_stop)
+            
+            if self.config.fleet_potential_mode == "k_hop":
+                # Spread density to k-hop neighborhood
+                neighbors = self._k_hop_neighbor_cache.get(target_stop, [target_stop])
+                spread_value = 1.0 / max(1, len(neighbors))
+                for neighbor in neighbors:
+                    density[int(neighbor)] = density.get(int(neighbor), 0.0) + spread_value
+            else:
+                # "next_stop" mode: count at target only
+                density[target_stop] = density.get(target_stop, 0.0) + 1.0
+        
+        return density
+    
+    def _apply_fleet_potential_phi(self, density: float) -> float:
+        """Apply normalization function phi to density value.
+        
+        Args:
+            density: Raw density count C(u)
+        
+        Returns:
+            Normalized fleet potential in range [0, 1]
+        """
+        num_vehicles = max(1, self.config.num_vehicles)
+        
+        if self.config.fleet_potential_phi == "linear_norm":
+            return float(density / num_vehicles)
+        else:
+            # Default: log1p_norm
+            # phi(C) = log(1 + C) / log(1 + num_vehicles)
+            return float(np.log1p(density) / np.log1p(num_vehicles))
+
     def _schedule_event(self, time_sec: float, event_type: str, payload: dict) -> None:
         priority = EVENT_PRIORITY.get(event_type, 99)
         heapq.heappush(self.event_queue, (float(time_sec), int(priority), int(self.event_seq), event_type, payload))
@@ -867,7 +941,7 @@ class EventDrivenEnv:
                 node_features[idx, 4] = self.geo_embedding_scalar[int(stop_id)]
             return {
                 "node_features": node_features,
-                "edge_features": np.zeros((0, 4), dtype=np.float32),
+                "edge_features": np.zeros((0, 5 if self.config.use_fleet_potential else 4), dtype=np.float32),
                 "action_mask": np.zeros((0,), dtype=bool),
                 "actions": np.zeros((0,), dtype=np.int64),
                 "action_node_indices": np.zeros((0,), dtype=np.int64),
@@ -892,7 +966,16 @@ class EventDrivenEnv:
             node_features[idx, 4] = self.geo_embedding_scalar[int(stop_id)]
 
         actions, mask = self.get_action_mask(debug=self.config.debug_mask)
-        edge_features = np.zeros((len(actions), 4), dtype=np.float32)
+        base_edge_dim = 4
+        edge_dim = 5 if self.config.use_fleet_potential else base_edge_dim
+        edge_features = np.zeros((len(actions), edge_dim), dtype=np.float32)
+        
+        # Compute fleet density if FAEP enabled
+        fleet_density_map: Dict[int, float] = {}
+        if self.config.use_fleet_potential:
+            fleet_density_map = self._compute_fleet_density_by_stop()
+            # Store for logging in step()
+            self._last_fleet_density_map = fleet_density_map
         for i, action in enumerate(actions):
             travel_time = dict(self.neighbors.get(vehicle.current_stop, [])).get(action, 0.0)
             delta_eta_max = 0.0
@@ -930,6 +1013,12 @@ class EventDrivenEnv:
             edge_features[i, 1] = float(delta_cvar)
             edge_features[i, 2] = float(min(count_violation, 100.0))
             edge_features[i, 3] = float(min(travel_time, MAX_TIME_VAL))
+            
+            # Append fleet potential as 5th dimension if FAEP enabled
+            if self.config.use_fleet_potential:
+                # action is stop_id (Indexing Contract)
+                raw_density = fleet_density_map.get(int(action), 0.0)
+                edge_features[i, 4] = self._apply_fleet_potential_phi(raw_density)
 
         full_batch = {
             "node_features": node_features,
@@ -964,14 +1053,18 @@ class EventDrivenEnv:
                     continue
                 src_list.append(local_index[int(src_stop_id)])
                 dst_list.append(local_index[int(dst_stop_id)])
-                edge_attr_list.append([0.0, 0.0, 0.0, float(travel_time)])
+                if self.config.use_fleet_potential:
+                    edge_attr_list.append([0.0, 0.0, 0.0, float(travel_time), 0.0])
+                else:
+                    edge_attr_list.append([0.0, 0.0, 0.0, float(travel_time)])
 
         if src_list:
             sub_edge_index = np.array([src_list, dst_list], dtype=np.int64)
             sub_edge_features = np.array(edge_attr_list, dtype=np.float32)
         else:
             sub_edge_index = np.zeros((2, 0), dtype=np.int64)
-            sub_edge_features = np.zeros((0, 4), dtype=np.float32)
+            edge_dim = 5 if self.config.use_fleet_potential else 4
+            sub_edge_features = np.zeros((0, edge_dim), dtype=np.float32)
 
         return {
             "node_features": sub_node_features,
@@ -996,7 +1089,16 @@ class EventDrivenEnv:
             vehicle = self._get_active_vehicle()
             if vehicle is None:
                 self.done = True
-                return self._observe(), 0.0, True, {}
+                # Populate info for early-return path
+                waiting_remaining = float(sum(len(q) for q in self.waiting.values()))
+                onboard_remaining = float(sum(len(v.onboard) for v in self.vehicles))
+                info = {
+                    "done_reason": "no_valid_action",
+                    "waiting_remaining": waiting_remaining,
+                    "onboard_remaining": onboard_remaining,
+                    "waiting_timeouts": float(self.waiting_timeouts),
+                }
+                return self._observe(), 0.0, True, info
         
         neighbor_actions = [dst for dst, _ in self.neighbors.get(vehicle.current_stop, [])]
         if action not in neighbor_actions:
@@ -1096,7 +1198,30 @@ class EventDrivenEnv:
             "reward_tacc_bonus": float(reward_tacc),
             "reward_total": float(reward),
         }
+        
+        # Add backlog fields (always available)
+        waiting_remaining = float(sum(len(q) for q in self.waiting.values()))
+        onboard_remaining = float(sum(len(v.onboard) for v in self.vehicles))
+        info["waiting_remaining"] = waiting_remaining
+        info["onboard_remaining"] = onboard_remaining
+        
         if self.done:
+            # Determine done_reason
+            if self.steps >= self.config.max_horizon_steps:
+                done_reason = "max_horizon"
+            elif not self.event_queue:
+                done_reason = "event_queue_empty"
+            else:
+                done_reason = "no_valid_action"
+            info["done_reason"] = done_reason
+            
+            # Apply terminal backlog penalty (normalized)
+            if self.config.reward_terminal_backlog_penalty > 0:
+                norm_backlog = (waiting_remaining + onboard_remaining) / max(1, self.config.max_requests)
+                terminal_penalty = self.config.reward_terminal_backlog_penalty * norm_backlog
+                reward -= terminal_penalty
+                info["terminal_backlog_penalty_applied"] = float(terminal_penalty)
+            
             info["event_trace_digest"] = self._event_trace_digest()
             info["event_trace_length"] = float(len(self.event_log))
             info["service_by_stop"] = dict(self.service_count_by_stop)
@@ -1107,6 +1232,26 @@ class EventDrivenEnv:
             ))
         if self.config.debug_mask:
             info["mask_debug"] = self.last_mask_debug
+        
+        # Fleet density summary (FAEP logging - required when enabled)
+        if self.config.use_fleet_potential:
+            density_map = getattr(self, "_last_fleet_density_map", {})
+            if density_map:
+                density_values = list(density_map.values())
+                # Convert to native Python types for JSON serialization
+                info["fleet_density_summary"] = {
+                    "max": float(max(density_values)) if density_values else 0.0,
+                    "mean": float(sum(density_values) / len(density_values)) if density_values else 0.0,
+                    "top_5_congested_stops": [
+                        (int(stop_id), float(density))
+                        for stop_id, density in sorted(
+                            density_map.items(), key=lambda x: x[1], reverse=True
+                        )[:5]
+                    ],
+                }
+            else:
+                info["fleet_density_summary"] = {"max": 0.0, "mean": 0.0, "top_5_congested_stops": []}
+        
         return self._observe(), reward, self.done, info
 
     def _init_step_stats(self) -> Dict[str, float | List[float]]:

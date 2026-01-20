@@ -17,6 +17,7 @@ from src.env.gym_env import EnvConfig, EventDrivenEnv
 from src.train.dqn import build_hashes
 from src.utils.hashing import sha256_file
 from src.utils.fairness import compute_service_volume_gini
+from src.utils.feature_spec import get_edge_dim, validate_checkpoint_edge_dim
 
 # Lazy imports to avoid dependency issues
 EdgeQGNN = None  # Loaded on demand if policy=edgeq
@@ -512,6 +513,11 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         ),
         time_split_mode=env_cfg.get("time_split_mode"),
         time_split_ratio=float(env_cfg.get("time_split_ratio", 0.3)),
+        # FAEP configuration
+        use_fleet_potential=bool(env_cfg.get("use_fleet_potential", False)),
+        fleet_potential_mode=str(env_cfg.get("fleet_potential_mode", "next_stop")),
+        fleet_potential_k=int(env_cfg.get("fleet_potential_k", 1)),
+        fleet_potential_phi=str(env_cfg.get("fleet_potential_phi", "log1p_norm")),
     )
 
 
@@ -546,14 +552,38 @@ def evaluate(config: Dict[str, Any], config_path: str | Path, run_dir: Optional[
             raise ValueError("eval.model_path is required for edgeq policy")
         # Dynamic import to avoid torch_geometric dependency when not needed
         from src.models.edge_q_gnn import EdgeQGNN
+        
+        # Use unified edge_dim function
+        env_edge_dim = get_edge_dim(env_cfg)
+        use_fleet_potential = bool(env_cfg.get("use_fleet_potential", False))
+        
         model = EdgeQGNN(
             node_dim=int(model_cfg.get("node_dim", 5)),
-            edge_dim=int(model_cfg.get("edge_dim", 4)),
+            edge_dim=env_edge_dim,
             hidden_dim=int(model_cfg.get("hidden_dim", 32)),
             num_layers=int(model_cfg.get("num_layers", 2)),
             dropout=float(model_cfg.get("dropout", 0.0)),
         )
-        model.load_state_dict(torch.load(eval_config.model_path, map_location=device))
+        
+        # Load checkpoint and validate edge_dim compatibility
+        checkpoint = torch.load(eval_config.model_path, map_location=device)
+        checkpoint_edge_dim = checkpoint.get("edge_dim", 4) if isinstance(checkpoint, dict) and "edge_dim" in checkpoint else 4
+        
+        # If checkpoint is just state_dict, infer edge_dim from q_head layer
+        if not isinstance(checkpoint, dict) or "edge_dim" not in checkpoint:
+            # Try to infer from model weights
+            state_dict = checkpoint if isinstance(checkpoint, dict) else checkpoint
+            q_head_key = "q_head.0.weight"
+            if q_head_key in state_dict:
+                q_head_in = state_dict[q_head_key].shape[1]
+                # q_head input = hidden_dim * 2 + edge_dim
+                hidden_dim = int(model_cfg.get("hidden_dim", 32))
+                checkpoint_edge_dim = q_head_in - hidden_dim * 2
+        
+        # Validate compatibility
+        validate_checkpoint_edge_dim(checkpoint_edge_dim, env_edge_dim, use_fleet_potential)
+        
+        model.load_state_dict(checkpoint if isinstance(checkpoint, dict) and "edge_dim" not in checkpoint else checkpoint)
         model.to(device)
         model.eval()
 

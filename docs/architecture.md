@@ -44,6 +44,17 @@
 - Onboard delay penalty (simplified): apply churn probability to delay over direct time
 - Graph build fixes zero travel time edges and can prune zero-in/zero-out nodes
 
+## Fleet-Aware Edge Potential (Optional)
+
+For large-scale fleet scenarios (e.g., 50+ vehicles), we optionally augment edge features with a `fleet_potential` dimension that captures the congestion level at each candidate destination stop. This serves as an observational signal to mitigate herding effects, without altering the decentralized execution architecture or introducing joint action spaces.
+
+- **Computation**: For each stop u, count vehicles whose next target is u (or k-hop neighborhood)
+- **Normalization**: `phi(C) = log(1+C) / log(1+num_vehicles)`
+- **Injection**: Appended as the 5th dimension of edge_features
+- **Default**: Disabled (`use_fleet_potential: false`) to maintain full reproducibility of existing experiments
+
+See `docs/fleet_aware_edge_potential.md` for detailed design and implementation.
+
 ## Reward Defaults (Current Implementation)
 - churn_tol_sec: 300
 - churn_beta: 0.02

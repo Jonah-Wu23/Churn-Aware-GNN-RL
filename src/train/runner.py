@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable, Tuple
+import hashlib
 import json
 import logging
 import time
@@ -12,23 +13,62 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn import functional as F
 
 from src.env.gym_env import EnvConfig, EventDrivenEnv
 from src.models.edge_q_gnn import EdgeQGNN
 from src.train.curriculum import StageSpec, default_stages, generate_stage, load_nodes, load_od_frames, stress_stages
 from src.train.dqn import DQNConfig, DQNTrainer, build_hashes, write_run_meta
+from src.train.reward_ramp import RampConfig, build_ramp_config, compute_ramped_weights, DEFAULT_RAMP_FIELDS
+from src.train.evaluation_checkpointer import EvalConfig, EvaluationCheckpointer, compute_env_cfg_hash
 from src.utils.config import load_config
+from src.utils.feature_spec import get_edge_dim
 
 LOG = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
+class StageFailedError(Exception):
+    """Raised when a stage fails to reach trigger_rho after max extensions."""
+    def __init__(self, stage: str, rho: float, trigger_rho: float):
+        self.stage = stage
+        self.rho = rho
+        self.trigger_rho = trigger_rho
+        super().__init__(f"Stage {stage} failed: rho={rho:.4f} < trigger={trigger_rho:.4f}")
+
+
+@dataclass
 class CurriculumConfig:
-    stages: List[str]
-    trigger_rho: float
-    gamma: float
-    stage_max_steps: int
-    stage_min_episodes: int
+    """Configuration for curriculum learning with rho-gated transitions."""
+    stages: List[str] = field(default_factory=lambda: ["L0", "L1", "L2", "L3"])
+    trigger_rho: float = 0.5  # Changed from 0.8 to 0.5
+    gamma: float = 1.0
+    stage_max_steps: int = 50000
+    stage_min_episodes: int = 3
+    
+    # Rho-gated transition settings
+    rho_window_size: int = 5
+    require_rho_transition: bool = True
+    stage_extension_steps: int = 30000
+    max_stage_extensions: int = 2
+    fail_policy: str = "fail_fast"  # "fail_fast" or "forced"
+    rho_warning_threshold: float = 0.35  # 70% of trigger_rho (0.5)
+    
+    # Collapse protection
+    collapse_drop_delta: float = 0.10
+    collapse_min_rho: float = 0.15
+    collapse_patience: int = 2
+    epsilon_cap_on_collapse: float = 0.3
+    cap_steps: int = 5000
+    lr_mult_on_collapse: float = 0.5
+    
+    # Evaluation settings
+    eval_enabled: bool = True
+    eval_seeds: List[int] = field(default_factory=lambda: [42, 123, 456, 789, 1000])
+    eval_interval_steps: int = 5000
+    
+    # Reward ramp settings
+    reward_ramp_steps: int = 10000
+    ramp_fields: List[str] = field(default_factory=lambda: DEFAULT_RAMP_FIELDS.copy())
 
 
 def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
@@ -71,32 +111,170 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         travel_time_multiplier=float(env_cfg.get("travel_time_multiplier", 1.0)),
         time_split_mode=env_cfg.get("time_split_mode"),
         time_split_ratio=float(env_cfg.get("time_split_ratio", 0.3)),
+        # FAEP configuration
+        use_fleet_potential=bool(env_cfg.get("use_fleet_potential", False)),
+        fleet_potential_mode=str(env_cfg.get("fleet_potential_mode", "next_stop")),
+        fleet_potential_k=int(env_cfg.get("fleet_potential_k", 1)),
+        fleet_potential_phi=str(env_cfg.get("fleet_potential_phi", "log1p_norm")),
+        reward_terminal_backlog_penalty=float(env_cfg.get("reward_terminal_backlog_penalty", 0.0)),
     )
 
 
-def _stage_specs_from_config(curriculum_cfg: Dict[str, Any]) -> List[StageSpec]:
+def _stage_specs_from_config(
+    curriculum_cfg: Dict[str, Any],
+    strict_stage_params: bool = False,
+) -> Tuple[List[StageSpec], Dict[str, Dict]]:
+    """Parse stage_params into StageSpec list and env_overrides map.
+    
+    Args:
+        curriculum_cfg: Curriculum configuration dict
+        strict_stage_params: If True, raise ValueError for unknown fields; else warning
+    
+    Returns:
+        Tuple of (stage_specs, env_overrides_map)
+    """
+    # StageSpec accepts only these OD sampling fields
+    STAGESPEC_FIELDS = {
+        "name", "description", "density_multiplier", "sample_fraction", 
+        "time_scale", "center_quantile", "edge_quantile", "short_trip_quantile",
+        "long_trip_quantile", "center_ratio", "churn_tol_override_sec", "travel_time_multiplier"
+    }
+    
     defaults = {spec.name: spec for spec in default_stages()}
     names = curriculum_cfg.get("stages", list(defaults.keys()))
     stage_params = curriculum_cfg.get("stage_params", {})
+    
     specs: List[StageSpec] = []
+    env_overrides_map: Dict[str, Dict] = {}
+    
     for name in names:
         base = defaults.get(name, StageSpec(name=name, description="Custom curriculum stage"))
         overrides = stage_params.get(name, {})
-        params = {**base.__dict__, **overrides}
-        params["name"] = name
+        
+        # Split: OD sampling params vs env_overrides
+        od_params = {k: v for k, v in overrides.items() if k in STAGESPEC_FIELDS}
+        env_overrides_map[name] = overrides.get("env_overrides", {})
+        
+        # Strong validation: unknown fields not in env_overrides
+        for k in overrides:
+            if k not in STAGESPEC_FIELDS and k != "env_overrides":
+                msg = f"Stage {name}: field '{k}' not in STAGESPEC_FIELDS. Put it under env_overrides."
+                if strict_stage_params:
+                    raise ValueError(msg)
+                else:
+                    LOG.warning(msg)
+        
+        params = {**base.__dict__, **od_params, "name": name}
         specs.append(StageSpec(**params))
-    return specs
+    
+    return specs, env_overrides_map
 
 
 def _compute_service_rate(log: Dict[str, float]) -> float:
+    """Compute service rate with backlog in denominator.
+    
+    Denominator: all requests that entered the system (served + churned + timeouts + backlog).
+    """
     served = float(log.get("served", 0.0))
     waiting_churned = float(log.get("waiting_churned", 0.0))
     onboard_churned = float(log.get("onboard_churned", 0.0))
     waiting_timeouts = float(log.get("waiting_timeouts", 0.0))
-    eligible = served + waiting_churned + onboard_churned + waiting_timeouts
+    waiting_remaining = float(log.get("waiting_remaining", 0.0))
+    onboard_remaining = float(log.get("onboard_remaining", 0.0))
+    
+    eligible = (served + waiting_churned + onboard_churned + 
+                waiting_timeouts + waiting_remaining + onboard_remaining)
     if eligible <= 0:
         return 0.0
     return served / eligible
+
+
+def _compute_rho(log: Dict[str, float], gamma: float) -> float:
+    """Compute rho metric from episode log: service_rate / (1 + gamma * stuckness)."""
+    service_rate = _compute_service_rate(log)
+    stuckness = float(log.get("stuckness", 0.0))
+    return float(service_rate / (1.0 + gamma * stuckness))
+
+
+def _compute_rho_window_mean(rho_history: List[float], window_size: int) -> float:
+    """Compute mean rho over the last window_size episodes."""
+    if not rho_history:
+        return 0.0
+    window = rho_history[-window_size:]
+    return float(np.mean(window))
+
+
+def _merge_env_cfg(
+    base_cfg: Dict[str, Any],
+    stage_overrides: Dict[str, float | int],
+    phase_overrides: Optional[Dict[str, float | int]],
+) -> Dict[str, Any]:
+    merged = dict(base_cfg)
+    merged.update(stage_overrides)
+    if phase_overrides:
+        merged.update(phase_overrides)
+    return merged
+
+
+def _behavior_clone(
+    trainer: DQNTrainer,
+    env: EventDrivenEnv,
+    steps: int,
+    log_handle,
+    log_every: int = 500,
+) -> None:
+    if steps <= 0:
+        return
+    env.reset()
+    losses: List[float] = []
+    for step in range(1, int(steps) + 1):
+        features = env.get_feature_batch()
+        action = _greedy_policy(features)
+        if action is None:
+            env.reset()
+            continue
+        actions = features["actions"].astype(np.int64)
+        mask = features["action_mask"].astype(bool)
+        if len(actions) == 0 or not np.any(mask):
+            env.reset()
+            continue
+        try:
+            target_idx = int(np.where(actions == int(action))[0][0])
+        except IndexError:
+            env.reset()
+            continue
+
+        q = trainer._q_values_single(
+            obs=features["node_features"],
+            obs_idx=int(features["current_node_index"][0]),
+            action_nodes=features["action_node_indices"].astype(np.int64),
+            action_edge=features["edge_features"],
+            requires_grad=True,
+        )
+        q_masked = q.clone()
+        q_masked[torch.tensor(~mask, device=q.device)] = -1e9
+        loss = F.cross_entropy(q_masked.unsqueeze(0), torch.tensor([target_idx], device=q.device))
+        trainer.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), float(trainer.config.max_grad_norm))
+        trainer.optimizer.step()
+        losses.append(float(loss.item()))
+
+        _, _reward, done, _info = env.step(int(action))
+        if done:
+            env.reset()
+
+        if log_every > 0 and step % int(log_every) == 0:
+            avg_loss = float(np.mean(losses)) if losses else 0.0
+            log_handle.write(
+                json.dumps(
+                    {"type": "behavior_cloning", "step": int(step), "avg_loss": avg_loss},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            log_handle.flush()
+            losses.clear()
 
 
 def _greedy_policy(features: Dict[str, np.ndarray]) -> Optional[int]:
@@ -141,12 +319,35 @@ def run_curriculum_training(
 
     curriculum = CurriculumConfig(
         stages=list(curriculum_cfg.get("stages", ["L0", "L1", "L2", "L3"])),
-        trigger_rho=float(curriculum_cfg.get("trigger_rho", 0.8)),
+        trigger_rho=float(curriculum_cfg.get("trigger_rho", 0.5)),
         gamma=float(curriculum_cfg.get("gamma", 1.0)),
         stage_max_steps=int(curriculum_cfg.get("stage_max_steps", 50_000)),
         stage_min_episodes=int(curriculum_cfg.get("stage_min_episodes", 3)),
+        # Rho-gated transition settings
+        rho_window_size=int(curriculum_cfg.get("rho_window_size", 5)),
+        require_rho_transition=bool(curriculum_cfg.get("require_rho_transition", True)),
+        stage_extension_steps=int(curriculum_cfg.get("stage_extension_steps", 30_000)),
+        max_stage_extensions=int(curriculum_cfg.get("max_stage_extensions", 2)),
+        fail_policy=str(curriculum_cfg.get("fail_policy", "fail_fast")),
+        rho_warning_threshold=float(curriculum_cfg.get("rho_warning_threshold", 0.35)),
+        # Collapse protection
+        collapse_drop_delta=float(curriculum_cfg.get("collapse_drop_delta", 0.10)),
+        collapse_min_rho=float(curriculum_cfg.get("collapse_min_rho", 0.15)),
+        collapse_patience=int(curriculum_cfg.get("collapse_patience", 2)),
+        epsilon_cap_on_collapse=float(curriculum_cfg.get("epsilon_cap_on_collapse", 0.3)),
+        cap_steps=int(curriculum_cfg.get("cap_steps", 5000)),
+        lr_mult_on_collapse=float(curriculum_cfg.get("lr_mult_on_collapse", 0.5)),
+        # Evaluation settings
+        eval_enabled=bool(curriculum_cfg.get("eval_enabled", True)),
+        eval_seeds=list(curriculum_cfg.get("eval_seeds", [42, 123, 456, 789, 1000])),
+        eval_interval_steps=int(curriculum_cfg.get("eval_interval_steps", 5000)),
+        # Reward ramp settings
+        reward_ramp_steps=int(curriculum_cfg.get("reward_ramp_steps", 10000)),
+        ramp_fields=list(curriculum_cfg.get("ramp_fields", DEFAULT_RAMP_FIELDS)),
     )
-    stage_specs = _stage_specs_from_config(curriculum_cfg)
+    # Read strict_stage_params and parse stages
+    strict = bool(curriculum_cfg.get("strict_stage_params", False))
+    stage_specs, stage_env_overrides_map = _stage_specs_from_config(curriculum_cfg, strict_stage_params=strict)
 
     if run_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -197,7 +398,7 @@ def run_curriculum_training(
 
     model = EdgeQGNN(
         node_dim=int(model_cfg.get("node_dim", 5)),
-        edge_dim=int(model_cfg.get("edge_dim", 4)),
+        edge_dim=get_edge_dim(env_cfg),  # Use unified tool function
         hidden_dim=int(model_cfg.get("hidden_dim", 32)),
         num_layers=int(model_cfg.get("num_layers", 2)),
         dropout=float(model_cfg.get("dropout", 0.0)),
@@ -225,10 +426,32 @@ def run_curriculum_training(
         start_index = 0
         run_specs = all_specs
 
+    l3_two_stage_cfg = curriculum_cfg.get("l3_two_stage", {})
+    l3_two_stage_enabled = bool(l3_two_stage_cfg.get("enabled", False))
+    phase1_steps_default = int(curriculum.stage_max_steps * 0.4)
+    phase1_steps_cfg = int(l3_two_stage_cfg.get("phase1_steps", phase1_steps_default))
+    phase2_steps_cfg = l3_two_stage_cfg.get("phase2_steps")
+    phase1_steps = max(0, min(int(curriculum.stage_max_steps), phase1_steps_cfg))
+    remaining_steps = int(curriculum.stage_max_steps) - phase1_steps
+    if phase2_steps_cfg is None:
+        phase2_steps = remaining_steps
+        phase3_steps = 0
+    else:
+        phase2_steps = max(0, min(int(remaining_steps), int(phase2_steps_cfg)))
+        phase3_steps = max(0, int(curriculum.stage_max_steps) - phase1_steps - phase2_steps)
+    phase1_overrides = l3_two_stage_cfg.get("phase1_env_overrides")
+    phase2_overrides = l3_two_stage_cfg.get("phase2_env_overrides")
+    phase3_overrides = l3_two_stage_cfg.get("phase3_env_overrides")
+    bc_cfg = l3_two_stage_cfg.get("behavior_cloning", {})
+    bc_enabled = bool(bc_cfg.get("enabled", False))
+    bc_steps = int(bc_cfg.get("steps", 0))
+    bc_log_every = int(bc_cfg.get("log_every", 500))
+
     for local_idx, spec in enumerate(run_specs):
         current_stage_idx = start_index + local_idx
         stage_dir = run_dir / f"stage_{spec.name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
+        best_model_path = stage_dir / "edgeq_model_best.pt"
         stage_output = generate_stage(
             base_od=base_od,
             nodes=nodes,
@@ -236,48 +459,356 @@ def run_curriculum_training(
             output_dir=stage_dir,
             seed=int(dqn_config.seed),
         )
-        stage_env_cfg = dict(env_cfg)
-        stage_env_cfg["od_glob"] = str(stage_output.od_path)
-        stage_env_cfg.update(stage_output.env_overrides)
-        env = EventDrivenEnv(_build_env_config(stage_env_cfg))
-        graph_hashes, od_hashes = build_hashes(stage_env_cfg)
-        trainer = DQNTrainer(env=env, model=model, config=dqn_config, run_dir=stage_dir, graph_hashes=graph_hashes, od_hashes=od_hashes)
+        stage_env_base = dict(env_cfg)
+        stage_env_base["od_glob"] = str(stage_output.od_path)
 
         episode_count = 0
         latest_rho = 0.0
+        rho_history: List[float] = []  # Track rho for window mean
+        best_service_rate = -1.0
+        best_state_dict: Optional[Dict[str, torch.Tensor]] = None
+        trainer: Optional[DQNTrainer] = None
+        current_phase: str = "main"  # Track current phase for logging
+        phase_step: int = 0  # Track steps within phase for ramp
+        current_env_cfg: Dict[str, Any] = {}  # Track current env config
 
         def _on_episode_end(ep_log: Dict[str, float]) -> bool:
-            nonlocal episode_count, latest_rho
+            nonlocal episode_count, latest_rho, rho_history, best_service_rate, best_state_dict, trainer, current_phase
             episode_count += 1
+            
+            # Compute metrics
             service_rate = _compute_service_rate(ep_log)
-            stuckness = float(ep_log.get("stuckness", 0.0))
-            rho = float(service_rate / (1.0 + curriculum.gamma * stuckness))
+            rho = _compute_rho(ep_log, curriculum.gamma)
             latest_rho = rho
+            rho_history.append(rho)
+            
+            # Compute window mean for transition decision
+            rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+            
+            # Enhanced logging with global_step and phase info
             record = {
                 "type": "episode",
                 "stage": spec.name,
+                "phase": current_phase,
                 "episode_index": int(episode_count),
+                "global_step": trainer.global_step if trainer else 0,
+                "epsilon": trainer.get_epsilon() if trainer else 1.0,
                 "service_rate": float(service_rate),
-                "stuckness": float(stuckness),
+                "stuckness": float(ep_log.get("stuckness", 0.0)),
                 "rho": float(rho),
+                "rho_window_mean": float(rho_window_mean),
                 "trigger_rho": float(curriculum.trigger_rho),
-                "min_episodes": int(curriculum.stage_min_episodes),
+                "env_cfg_hash": compute_env_cfg_hash(current_env_cfg) if current_env_cfg else "",
+                "replay_size": trainer.buffer.size if trainer else 0,
                 "episode_log": ep_log,
             }
             log_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             log_handle.flush()
+            
+            # Update best model based on service_rate (legacy behavior)
+            if trainer is not None and service_rate > best_service_rate:
+                best_service_rate = float(service_rate)
+                best_state_dict = {k: v.detach().cpu() for k, v in trainer.model.state_dict().items()}
+                trainer.save_model(best_model_path)
+            
+            # Warning if approaching max_steps with low rho
+            if rho_window_mean < curriculum.rho_warning_threshold:
+                LOG.warning("Stage %s rho_window_mean=%.3f < warning_threshold=%.3f",
+                           spec.name, rho_window_mean, curriculum.rho_warning_threshold)
+            
+            # Transition check: use rho_window_mean (not single rho)
             if episode_count < curriculum.stage_min_episodes:
                 return False
-            return rho >= curriculum.trigger_rho
+            return rho_window_mean >= curriculum.trigger_rho
 
-        trainer.train(total_steps=int(curriculum.stage_max_steps), episode_callback=_on_episode_end)
-        trainer.close()
+        if spec.name == "L3" and l3_two_stage_enabled:
+            # L3 Multi-Phase Training: Single trainer, switch env between phases
+            # This preserves global_step, replay buffer, and optimizer state
+            
+            # Merge: stage_output.env_overrides < stage_env_overrides_map (from YAML env_overrides)
+            combined_stage_overrides = {**stage_output.env_overrides, **stage_env_overrides_map.get(spec.name, {})}
+            
+            # Phase1: Initialize trainer
+            phase1_env_cfg = _merge_env_cfg(stage_env_base, combined_stage_overrides, phase1_overrides)
+            current_env_cfg = phase1_env_cfg
+            current_phase = "phase1"
+            env = EventDrivenEnv(_build_env_config(phase1_env_cfg))
+            graph_hashes, od_hashes = build_hashes(phase1_env_cfg)
+            
+            trainer = DQNTrainer(
+                env=env,
+                model=model,
+                config=dqn_config,
+                run_dir=stage_dir,
+                graph_hashes=graph_hashes,
+                od_hashes=od_hashes,
+                global_step_init=model._global_step if hasattr(model, '_global_step') else 0,
+            )
+            
+            # Log phase1 transition
+            log_handle.write(json.dumps({
+                "type": "phase_transition",
+                "stage": spec.name,
+                "from": None,
+                "to": "phase1",
+                "global_step": trainer.global_step,
+                "epsilon": trainer.get_epsilon(),
+                "replay_size": trainer.buffer.size,
+                "trainer_reinit": True,
+                "env_cfg_hash": compute_env_cfg_hash(phase1_env_cfg),
+                "env_overrides": phase1_overrides or {},
+            }, ensure_ascii=False) + "\n")
+            log_handle.flush()
+            
+            # Behavior cloning (optional)
+            if bc_enabled and bc_steps > 0:
+                log_handle.write(json.dumps({
+                    "type": "stage_phase",
+                    "stage": spec.name,
+                    "phase": "behavior_cloning",
+                    "steps": int(bc_steps),
+                }, ensure_ascii=False) + "\n")
+                log_handle.flush()
+                _behavior_clone(
+                    trainer=trainer,
+                    env=env,
+                    steps=int(bc_steps),
+                    log_handle=log_handle,
+                    log_every=int(bc_log_every),
+                )
+            
+            # Phase1 training
+            if phase1_steps > 0:
+                trainer.train(total_steps=int(phase1_steps), episode_callback=_on_episode_end)
+            
+            # Phase2: Switch env WITHOUT recreating trainer
+            if phase2_steps > 0:
+                phase2_env_cfg = _merge_env_cfg(stage_env_base, combined_stage_overrides, phase2_overrides)
+                current_env_cfg = phase2_env_cfg
+                current_phase = "phase2"
+                
+                # Create new env and attach to existing trainer
+                new_env = EventDrivenEnv(_build_env_config(phase2_env_cfg))
+                replay_size_before = trainer.buffer.size
+                trainer.env = new_env
+                trainer.env.reset()
+                
+                # Log phase2 transition
+                log_handle.write(json.dumps({
+                    "type": "phase_transition",
+                    "stage": spec.name,
+                    "from": "phase1",
+                    "to": "phase2",
+                    "global_step": trainer.global_step,
+                    "epsilon": trainer.get_epsilon(),
+                    "replay_size_before": replay_size_before,
+                    "replay_size_after": trainer.buffer.size,
+                    "trainer_reinit": False,
+                    "env_cfg_hash": compute_env_cfg_hash(phase2_env_cfg),
+                    "env_overrides": phase2_overrides or {},
+                }, ensure_ascii=False) + "\n")
+                log_handle.flush()
+                
+                trainer.train(total_steps=int(phase2_steps), episode_callback=_on_episode_end)
+            
+            # Phase3: Switch env again, with reward ramp support
+            if phase3_steps > 0:
+                # Build phase3 config with fallback to phase2
+                if not phase3_overrides or len(phase3_overrides) == 0:
+                    LOG.info("Phase3 overrides empty, inheriting from phase2")
+                    effective_phase3_overrides = phase2_overrides
+                else:
+                    effective_phase3_overrides = phase3_overrides
+                
+                phase3_env_cfg = _merge_env_cfg(stage_env_base, combined_stage_overrides, effective_phase3_overrides)
+                current_env_cfg = phase3_env_cfg
+                current_phase = "phase3"
+                
+                # Create new env and attach to existing trainer
+                new_env = EventDrivenEnv(_build_env_config(phase3_env_cfg))
+                replay_size_before = trainer.buffer.size
+                trainer.env = new_env
+                trainer.env.reset()
+                
+                # Log phase3 transition
+                log_handle.write(json.dumps({
+                    "type": "phase_transition",
+                    "stage": spec.name,
+                    "from": "phase2",
+                    "to": "phase3",
+                    "global_step": trainer.global_step,
+                    "epsilon": trainer.get_epsilon(),
+                    "replay_size_before": replay_size_before,
+                    "replay_size_after": trainer.buffer.size,
+                    "trainer_reinit": False,
+                    "env_cfg_hash": compute_env_cfg_hash(phase3_env_cfg),
+                    "env_overrides": effective_phase3_overrides or {},
+                    "phase3_inherited_from_phase2": (not phase3_overrides or len(phase3_overrides) == 0),
+                }, ensure_ascii=False) + "\n")
+                log_handle.flush()
+                
+                trainer.train(total_steps=int(phase3_steps), episode_callback=_on_episode_end)
+            
+            # L3 Extension loop: check rho after all phases complete
+            extension_count = 0
+            stage_passed = False
+            forced_transition = False
+            
+            while not stage_passed:
+                # Check if rho threshold met
+                rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+                
+                if len(rho_history) >= curriculum.stage_min_episodes and rho_window_mean >= curriculum.trigger_rho:
+                    LOG.info("Stage L3 PASSED: rho_window_mean=%.4f >= trigger=%.4f", 
+                             rho_window_mean, curriculum.trigger_rho)
+                    stage_passed = True
+                    break
+                
+                # Not passed - check if we should extend or fail
+                if not curriculum.require_rho_transition:
+                    LOG.warning("Stage L3 FORCED transition: rho_window_mean=%.4f < trigger=%.4f",
+                               rho_window_mean, curriculum.trigger_rho)
+                    forced_transition = True
+                    stage_passed = True
+                    break
+                
+                extension_count += 1
+                if extension_count > curriculum.max_stage_extensions:
+                    if curriculum.fail_policy == "fail_fast":
+                        LOG.error("Stage L3 FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions",
+                                  rho_window_mean, curriculum.trigger_rho, extension_count - 1)
+                        log_handle.write(json.dumps({
+                            "type": "stage_failed",
+                            "stage": "L3",
+                            "rho_window_mean": float(rho_window_mean),
+                            "trigger_rho": float(curriculum.trigger_rho),
+                            "extensions": extension_count - 1,
+                        }, ensure_ascii=False) + "\n")
+                        log_handle.flush()
+                        raise StageFailedError("L3", rho_window_mean, curriculum.trigger_rho)
+                    else:
+                        LOG.warning("Stage L3 FORCED transition after max extensions")
+                        forced_transition = True
+                        stage_passed = True
+                        break
+                
+                # Log and run extension
+                LOG.warning("Stage L3 extension %d/%d: rho_window_mean=%.4f < trigger=%.4f",
+                           extension_count, curriculum.max_stage_extensions, rho_window_mean, curriculum.trigger_rho)
+                log_handle.write(json.dumps({
+                    "type": "stage_extension",
+                    "stage": "L3",
+                    "extension": extension_count,
+                    "rho_window_mean": float(rho_window_mean),
+                    "additional_steps": curriculum.stage_extension_steps,
+                }, ensure_ascii=False) + "\n")
+                log_handle.flush()
+                
+                trainer.train(total_steps=int(curriculum.stage_extension_steps), episode_callback=_on_episode_end)
+            
+            # Store final global_step on model for next stage
+            model._global_step = trainer.global_step
+            trainer.close()
+        else:
+            # Non-L3 stage training with extension loop
+            # Merge: stage_output.env_overrides < stage_env_overrides_map (from YAML env_overrides)
+            combined_stage_overrides = {**stage_output.env_overrides, **stage_env_overrides_map.get(spec.name, {})}
+            stage_env_cfg = _merge_env_cfg(stage_env_base, combined_stage_overrides, None)
+            current_env_cfg = stage_env_cfg
+            current_phase = "main"
+            env = EventDrivenEnv(_build_env_config(stage_env_cfg))
+            graph_hashes, od_hashes = build_hashes(stage_env_cfg)
+            trainer = DQNTrainer(
+                env=env,
+                model=model,
+                config=dqn_config,
+                run_dir=stage_dir,
+                graph_hashes=graph_hashes,
+                od_hashes=od_hashes,
+                global_step_init=model._global_step if hasattr(model, '_global_step') else 0,
+            )
+            
+            # Extension loop for rho-gated transitions
+            extension_count = 0
+            current_budget = int(curriculum.stage_max_steps)
+            stage_passed = False
+            forced_transition = False
+            
+            while not stage_passed:
+                # Train for current budget
+                trainer.train(total_steps=current_budget, episode_callback=_on_episode_end)
+                
+                # Check if rho threshold met
+                rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+                
+                if len(rho_history) >= curriculum.stage_min_episodes and rho_window_mean >= curriculum.trigger_rho:
+                    LOG.info("Stage %s PASSED: rho_window_mean=%.4f >= trigger=%.4f", 
+                             spec.name, rho_window_mean, curriculum.trigger_rho)
+                    stage_passed = True
+                    break
+                
+                # Not passed - check if we should extend or fail
+                if not curriculum.require_rho_transition:
+                    LOG.warning("Stage %s FORCED transition: rho_window_mean=%.4f < trigger=%.4f (require_rho_transition=False)",
+                               spec.name, rho_window_mean, curriculum.trigger_rho)
+                    forced_transition = True
+                    stage_passed = True
+                    break
+                
+                extension_count += 1
+                if extension_count > curriculum.max_stage_extensions:
+                    if curriculum.fail_policy == "fail_fast":
+                        LOG.error("Stage %s FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions",
+                                  spec.name, rho_window_mean, curriculum.trigger_rho, extension_count - 1)
+                        # Log failure event
+                        log_handle.write(json.dumps({
+                            "type": "stage_failed",
+                            "stage": spec.name,
+                            "rho_window_mean": float(rho_window_mean),
+                            "trigger_rho": float(curriculum.trigger_rho),
+                            "extensions": extension_count - 1,
+                            "fail_policy": curriculum.fail_policy,
+                        }, ensure_ascii=False) + "\n")
+                        log_handle.flush()
+                        raise StageFailedError(spec.name, rho_window_mean, curriculum.trigger_rho)
+                    else:
+                        # forced policy
+                        LOG.warning("Stage %s FORCED transition after max extensions: rho_window_mean=%.4f < trigger=%.4f",
+                                   spec.name, rho_window_mean, curriculum.trigger_rho)
+                        forced_transition = True
+                        stage_passed = True
+                        break
+                
+                # Log extension
+                LOG.warning("Stage %s extension %d/%d: rho_window_mean=%.4f < trigger=%.4f, adding %d steps",
+                           spec.name, extension_count, curriculum.max_stage_extensions, 
+                           rho_window_mean, curriculum.trigger_rho, curriculum.stage_extension_steps)
+                log_handle.write(json.dumps({
+                    "type": "stage_extension",
+                    "stage": spec.name,
+                    "extension": extension_count,
+                    "max_extensions": curriculum.max_stage_extensions,
+                    "rho_window_mean": float(rho_window_mean),
+                    "trigger_rho": float(curriculum.trigger_rho),
+                    "additional_steps": curriculum.stage_extension_steps,
+                }, ensure_ascii=False) + "\n")
+                log_handle.flush()
+                
+                current_budget = int(curriculum.stage_extension_steps)
+            
+            model._global_step = trainer.global_step
+            trainer.close()
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+            torch.save(best_state_dict, best_model_path)
         write_run_meta(
             run_dir,
             model_path_final=(stage_dir / "edgeq_model_final.pt") if (stage_dir / "edgeq_model_final.pt").exists() else None,
             model_path_latest=(stage_dir / "edgeq_model_latest.pt") if (stage_dir / "edgeq_model_latest.pt").exists() else None,
             extra={"stage": spec.name, "stage_dir": str(stage_dir)},
         )
+        # Compute final rho_window_mean for transition log
+        final_rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
         transition = {
             "type": "stage_transition",
             "from_stage": spec.name,
@@ -285,7 +816,10 @@ def run_curriculum_training(
             "stage_index": int(current_stage_idx),
             "episodes": int(episode_count),
             "last_rho": float(latest_rho),
+            "rho_window_mean": float(final_rho_window_mean),
             "trigger_rho": float(curriculum.trigger_rho),
+            "passed": final_rho_window_mean >= curriculum.trigger_rho,
+            "forced_transition": 'forced_transition' in dir() and forced_transition,
         }
         log_handle.write(json.dumps(transition, ensure_ascii=False) + "\n")
         log_handle.flush()

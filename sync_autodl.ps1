@@ -3,9 +3,10 @@ $uploadDir = Join-Path $projectRoot "autodl_upload"
 
 $syncPaths = @(
     @{Source="src"; Include=@("*.py"); Exclude=@("__pycache__")},
-    @{Source="scripts"; Include=@("*.py"); Exclude=@()},
+    @{Source="scripts"; Include=@("*.py"); Exclude=@("__pycache__")},
     @{Source="configs"; Include=@("*.yaml"); Exclude=@()},
     @{Source="tests"; Include=@("*.py"); Exclude=@("__pycache__")},
+    @{Source="docs"; Include=@("*.md"); Exclude=@()},
     @{Source="."; Include=@("requirements.txt", "pytest.ini"); Exclude=@()}
 )
 

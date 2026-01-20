@@ -73,9 +73,14 @@ class RiskAblatedEnv(EventDrivenEnv):
         - [1] delta_cvar: 置零（消融）
         - [2] violation_count: 保留
         - [3] travel_time: 保留
+        - [4] fleet_potential: 保留（若FAEP启用，独立于风险消融）
+        
+        FAEP兼容性：当 use_fleet_potential=True 时，edge_features 为5维，
+        第5维 fleet_potential 不受风险消融影响，保持原值。
         """
         batch = super().get_feature_batch(k_hop)
         # edge_features[:, 1] 原为 delta_cvar，置零
+        # 注意：只修改第2维，保留其他维度（包括FAEP的第5维）
         if batch["edge_features"].shape[0] > 0:
             batch["edge_features"][:, 1] = 0.0
         return batch

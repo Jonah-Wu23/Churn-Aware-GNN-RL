@@ -6,7 +6,8 @@ from dataclasses import dataclass
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple
+import random
 
 import numpy as np
 import torch
@@ -76,11 +77,14 @@ class DQNTrainer:
         run_dir: Path,
         graph_hashes: Dict[str, str],
         od_hashes: Dict[str, str],
+        global_step_init: int = 0,
+        env_cfg: Optional[Dict[str, object]] = None,
     ) -> None:
         self.env = env
         self.model = model
         self.config = config
         self.device = torch.device(config.device)
+        self._env_cfg = env_cfg or {}  # 用于终止惩罚计算
         self.graph_hashes = graph_hashes
         self.od_hashes = od_hashes
 
@@ -96,6 +100,14 @@ class DQNTrainer:
 
         self.rng = np.random.default_rng(int(config.seed))
         torch.manual_seed(int(config.seed))
+        random.seed(int(config.seed))
+
+        # Global step as the single source of truth for epsilon
+        self.global_step = int(global_step_init)
+        
+        # Epsilon cap support for collapse protection
+        self.epsilon_cap: Optional[float] = None
+        self.epsilon_cap_remaining: int = 0
 
         spec = BufferSpec(
             num_nodes=int(len(env.stop_ids)),
@@ -140,8 +152,40 @@ class DQNTrainer:
             "waiting_churned": float(getattr(env, "waiting_churned", 0.0)),
             "waiting_timeouts": float(getattr(env, "waiting_timeouts", 0.0)),
             "onboard_churned": float(getattr(env, "onboard_churned", 0.0)),
-            "structural_unserviceable": float(getattr(env, "structural_unserviceable", 0.0)),
+            "structural_unserviceable": float(getattr(env, "structurally_unserviceable", 0.0)),
+            "waiting_remaining": float(sum(len(q) for q in getattr(env, "waiting", {}).values())),
+            "onboard_remaining": float(sum(len(v.onboard) for v in getattr(env, "vehicles", []))),
         }
+
+    def _compute_terminal_backlog_penalty(self) -> Tuple[float, float, float, float]:
+        """计算终止积压惩罚（无有效动作时调用）。
+        
+        Returns:
+            Tuple of (penalty, waiting_remaining, onboard_remaining, waiting_timeouts)
+        """
+        env = self.env
+        waiting_remaining = float(sum(len(q) for q in getattr(env, "waiting", {}).values()))
+        onboard_remaining = float(sum(len(v.onboard) for v in getattr(env, "vehicles", [])))
+        waiting_timeouts = float(getattr(env, "waiting_timeouts", 0))
+        max_requests = float(self._env_cfg.get("max_requests", 2000))
+        penalty_coef = float(self._env_cfg.get("reward_terminal_backlog_penalty", 0.0))
+        
+        if penalty_coef <= 0 or max_requests <= 0:
+            return 0.0, waiting_remaining, onboard_remaining, waiting_timeouts
+        
+        norm_backlog = (waiting_remaining + onboard_remaining) / max_requests
+        penalty = penalty_coef * norm_backlog
+        return penalty, waiting_remaining, onboard_remaining, waiting_timeouts
+
+    def _attach_env(self, new_env, new_env_cfg: Optional[Dict[str, object]] = None) -> None:
+        """重新绑定环境（用于 L3 phase 切换）。"""
+        self.env = new_env
+        if new_env_cfg is not None:
+            self._env_cfg = new_env_cfg
+        # 刷新图张量缓存
+        self.graph_edge_index = torch.tensor(new_env.graph_edge_index, dtype=torch.long, device=self.device)
+        self.graph_edge_features = torch.tensor(new_env.graph_edge_features, dtype=torch.float32, device=self.device)
+        self.env.reset()
 
     def close(self) -> None:
         if getattr(self, "_log_handle", None):
@@ -149,22 +193,95 @@ class DQNTrainer:
         if getattr(self, "_reward_log_handle", None):
             self._reward_log_handle.close()
 
+    def get_epsilon(self) -> float:
+        """获取当前epsilon值（考虑cap限制）"""
+        eps = _linear_schedule(
+            self.config.epsilon_start, self.config.epsilon_end,
+            self.config.epsilon_decay_steps, self.global_step
+        )
+        if self.epsilon_cap is not None and self.epsilon_cap_remaining > 0:
+            eps = min(eps, self.epsilon_cap)
+        return eps
+
+    def _get_rng_states(self) -> Dict[str, object]:
+        """获取所有RNG状态用于checkpoint"""
+        return {
+            "numpy_rng": self.rng.bit_generator.state,
+            "python_random": random.getstate(),
+            "torch_cpu": torch.get_rng_state(),
+            "torch_cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
+
+    def _set_rng_states(self, states: Dict[str, object]) -> None:
+        """从checkpoint恢复RNG状态"""
+        self.rng.bit_generator.state = states["numpy_rng"]
+        random.setstate(states["python_random"])
+        torch.set_rng_state(states["torch_cpu"])
+        if states["torch_cuda"] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(states["torch_cuda"])
+
     def _save_model(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.model.state_dict(), path)
         self._write_run_meta()
 
+    def save_model(self, path: Path) -> None:
+        """Public wrapper for saving model checkpoints."""
+        self._save_model(path)
+
     def _save_checkpoint(self, path: Path, step: int, episode_index: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "step": int(step),
+            "global_step": self.global_step,
             "episode_index": int(episode_index),
             "config": json.loads(json.dumps(self.config.__dict__)),
             "model_state_dict": self.model.state_dict(),
             "target_model_state_dict": self.target_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "replay_buffer": self.buffer.get_state(),
+            "rng_states": self._get_rng_states(),
+            "epsilon_cap": self.epsilon_cap,
+            "epsilon_cap_remaining": self.epsilon_cap_remaining,
         }
         torch.save(payload, path)
+
+    def save_full_checkpoint(self, path: Path, stage: str = "", phase: str = "", 
+                              extra_meta: Optional[Dict[str, object]] = None) -> None:
+        """保存完整checkpoint含元信息（用于best模型选择）"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "global_step": self.global_step,
+            "epsilon": self.get_epsilon(),
+            "stage": stage,
+            "phase": phase,
+            "model_state_dict": self.model.state_dict(),
+            "target_model_state_dict": self.target_model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "replay_buffer": self.buffer.get_state(),
+            "rng_states": self._get_rng_states(),
+        }
+        if extra_meta:
+            payload["extra_meta"] = extra_meta
+        torch.save(payload, path)
+
+    def restore_from_checkpoint(self, path: Path, restore_buffer: bool = True) -> None:
+        """从checkpoint恢复trainer状态"""
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.target_model.load_state_dict(ckpt["target_model_state_dict"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "global_step" in ckpt:
+            self.global_step = int(ckpt["global_step"])
+        if restore_buffer and "replay_buffer" in ckpt:
+            self.buffer.set_state(ckpt["replay_buffer"])
+        if "rng_states" in ckpt:
+            self._set_rng_states(ckpt["rng_states"])
+        if "epsilon_cap" in ckpt:
+            self.epsilon_cap = ckpt["epsilon_cap"]
+            self.epsilon_cap_remaining = ckpt.get("epsilon_cap_remaining", 0)
+        LOG.info("Restored from checkpoint: global_step=%d, epsilon=%.4f, buffer_size=%d",
+                 self.global_step, self.get_epsilon(), self.buffer.size)
 
     def _write_run_meta(self) -> None:
         latest_path = self.run_dir / "edgeq_model_latest.pt"
@@ -426,7 +543,19 @@ class DQNTrainer:
         last_info: Dict[str, float] = {}
         for step in iterator:
             final_step = int(step)
-            eps = _linear_schedule(cfg.epsilon_start, cfg.epsilon_end, cfg.epsilon_decay_steps, step)
+            # Increment global_step (single source of truth for epsilon)
+            self.global_step += 1
+            
+            # Compute epsilon from global_step (with cap support)
+            eps = self.get_epsilon()
+            
+            # Decrement epsilon_cap_remaining if active
+            if self.epsilon_cap_remaining > 0:
+                self.epsilon_cap_remaining -= 1
+                if self.epsilon_cap_remaining == 0:
+                    self.epsilon_cap = None
+                    LOG.info("Epsilon cap expired at global_step=%d", self.global_step)
+            
             features = self.env.get_feature_batch()
             mask = features["action_mask"].astype(bool)
             step_stuckness = float((~mask).mean()) if len(mask) else 1.0
@@ -515,6 +644,7 @@ class DQNTrainer:
                 log = {
                     "type": "episode",
                     "step": int(step),
+                    "global_step": self.global_step,
                     "epsilon": float(eps),
                     "episode_return": float(episode_return),
                     "episode_steps": int(episode_steps),
@@ -522,8 +652,32 @@ class DQNTrainer:
                     "waiting_churned": waiting_churned,
                     "onboard_churned": onboard_churned,
                     "structural_unserviceable": structural,
+                    "waiting_timeouts": int(info.get("waiting_timeouts", 0)),
+                    "waiting_remaining": int(info.get("waiting_remaining", 0)),
+                    "onboard_remaining": int(info.get("onboard_remaining", 0)),
+                    "done_reason": info.get("done_reason", "unknown"),
                     "stuckness": float(stuck_sum / max(1, episode_steps)),
+                    "replay_size": self.buffer.size,
                 }
+                
+                # Crash diagnostics for short episodes or event_queue empty
+                if episode_steps < 1000 or len(getattr(self.env, "event_queue", [])) == 0:
+                    try:
+                        vehicle = self.env._get_active_vehicle()
+                        features = self.env.get_feature_batch() if vehicle else {}
+                        mask = features.get("action_mask", np.array([])).astype(bool) if features else np.array([])
+                        log["crash_diag"] = {
+                            "current_stop": int(vehicle.current_stop) if vehicle else -1,
+                            "out_degree": len(self.env.neighbors.get(vehicle.current_stop, [])) if vehicle else 0,
+                            "mask_valid_ratio": float(mask.mean()) if len(mask) > 0 else 0.0,
+                            "event_queue_empty": len(getattr(self.env, "event_queue", [])) == 0,
+                            "ready_vehicle_count": len(getattr(self.env, "ready_vehicle_ids", [])),
+                            "waiting_remaining": int(info.get("waiting_remaining", 0)),
+                            "onboard_remaining": int(info.get("onboard_remaining", 0)),
+                        }
+                    except Exception as e:
+                        log["crash_diag"] = {"error": str(e), "type": "diag_failed"}
+                
                 self._log_handle.write(json.dumps(log, ensure_ascii=False) + "\n")
                 self._log_handle.flush()
                 stop = False
@@ -538,10 +692,10 @@ class DQNTrainer:
                     break
 
             if step % int(cfg.log_every_steps) == 0:
-                payload = {"type": "train", "step": int(step), "epsilon": float(eps), "buffer_size": int(self.buffer.size), **train_stats}
+                payload = {"type": "train", "step": int(step), "global_step": self.global_step, "epsilon": float(eps), "buffer_size": int(self.buffer.size), **train_stats}
                 self._log_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
                 self._log_handle.flush()
-                LOG.info("step=%d eps=%.3f buf=%d %s", step, eps, self.buffer.size, train_stats)
+                LOG.info("step=%d global=%d eps=%.3f buf=%d %s", step, self.global_step, eps, self.buffer.size, train_stats)
                 if tqdm is not None:
                     postfix = {"eps": round(eps, 3), "buf": int(self.buffer.size)}
                     if "loss" in train_stats:
@@ -569,4 +723,3 @@ def build_hashes(env_cfg: Dict[str, object]) -> tuple[Dict[str, str], Dict[str, 
         for path in sorted(Path().glob(od_glob)):
             od_hashes[str(path)] = sha256_file(path)
     return graph_hashes, od_hashes
-

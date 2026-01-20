@@ -25,6 +25,41 @@
 
 # 🔲 待完成事项
 
+## 0. EdgeQ 训练协议紧急修复 (最高优先级)
+
+> **背景**：L3训练已完成但未收敛（rho≈0.28，远低于trigger_rho=0.8）。L1/L2被"超时推进"而非"达标换关"，phase3出现明显回撤。
+
+### 0.1 修复关卡转换机制
+- [ ] **禁止超时换关**：修改curriculum逻辑，仅当rho达标时才触发stage transition
+- [ ] 增加 `stage_max_steps` 或让转场更严格依赖 `trigger_rho`
+- [ ] 添加日志警告：当接近max_steps但rho未达标时发出提示
+
+### 0.2 修复epsilon重置问题
+- [ ] **排查L3 epsilon回跳到0.99的原因**（进入L3后探索率被重置/拉高）
+- [ ] 确保跨phase时epsilon继承而非重置
+- [ ] 验证fix：L3 phase2→phase3时epsilon应平滑衰减
+
+### 0.3 修复phase3奖励切换导致的回撤
+- [ ] **phase3 env_overrides为空→回到默认奖励权重**，需改为渐进过渡
+- [ ] 延长phase2或让phase3变化更渐进（不要一次性切换）
+- [ ] 考虑phase间奖励权重线性插值过渡
+
+### 0.4 改进模型选择策略
+- [ ] **停止用"训练中单局service_rate极值"选模型**（易被低需求幸运局骗）
+- [ ] 实现**固定seed评估选模**：
+  - 每隔N步用3-5个固定seeds、epsilon=0评估
+  - 用评估rho均值选best checkpoint
+- [ ] 选模准则改为：优先最大化rho，其次service_rate
+- [ ] 每个stage保留3个checkpoint：`best_rho`, `best_service_rate`, `last`
+
+### 0.5 验收标准
+- [ ] L1/L2不再超时推进，必须rho≥trigger才换关
+- [ ] L3 phase切换时epsilon连续、奖励渐进
+- [ ] 使用固定seed评估选出的best模型，rho≥0.5
+- [ ] 训练曲线显示phase3不再出现回撤
+
+---
+
 ## 1. MOHITO/Wu2024 域内训练 (高优先级)
 
 训练器已实现，需要在Autodl上运行完整训练：
