@@ -44,6 +44,8 @@ LOG = logging.getLogger(__name__)
 @dataclass
 class EnvConfig:
     max_horizon_steps: int = 200
+    max_sim_time_sec: Optional[float] = None
+    allow_stop_when_actions_exist: bool = False
     mask_alpha: float = 1.5
     walk_threshold_sec: int = 600
     max_requests: int = 2000
@@ -61,16 +63,30 @@ class EnvConfig:
     onboard_churn_tol_sec: Optional[int] = None
     onboard_churn_beta: Optional[float] = None
     reward_service: float = 1.0
+    reward_service_transform: str = "none"
+    reward_service_transform_scale: float = 1.0
     reward_churn_penalty: Optional[float] = None
     reward_waiting_churn_penalty: float = 1.0
     reward_onboard_churn_penalty: float = 1.0
     reward_travel_cost_per_sec: float = 0.0
     reward_tacc_weight: float = 1.0
+    reward_tacc_transform: str = "none"
+    reward_tacc_transform_scale: float = 1.0
     reward_onboard_delay_weight: float = 0.1
     reward_cvar_penalty: float = 1.0
     reward_fairness_weight: float = 1.0
     reward_terminal_backlog_penalty: float = 0.0  # Normalized terminal backlog penalty
     reward_congestion_penalty: float = 0.0
+    reward_scale: float = 1.0
+    reward_step_backlog_penalty: float = 0.0  # Per-step penalty per waiting/onboard pax
+    reward_waiting_time_penalty_per_sec: float = 0.0  # Per-step penalty per waiting sec
+    reward_potential_alpha: float = 0.0
+    reward_potential_alpha_source: str = "env_default"
+    reward_potential_lost_weight: float = 0.0
+    reward_potential_scale_with_reward_scale: bool = True
+    debug_abort_on_alert: bool = True
+    debug_dump_dir: str = "reports/debug/potential_alerts"
+    demand_exhausted_min_time_sec: float = 300.0  # Grace period before demand-exhausted termination
     cvar_alpha: float = 0.95
     fairness_gamma: float = 1.0
     travel_time_multiplier: float = 1.0
@@ -103,6 +119,18 @@ class EnvConfig:
             self.onboard_churn_beta = float(self.churn_beta)
         if self.travel_time_multiplier <= 0:
             raise ValueError("travel_time_multiplier must be positive")
+        if self.max_sim_time_sec is not None and float(self.max_sim_time_sec) <= 0:
+            raise ValueError("max_sim_time_sec must be positive when set")
+        for field_name in ("reward_service_transform", "reward_tacc_transform"):
+            transform = getattr(self, field_name)
+            if transform not in {"none", "log1p"}:
+                raise ValueError(f"{field_name} must be 'none' or 'log1p'")
+        if self.reward_service_transform == "log1p" and self.reward_service_transform_scale <= 0:
+            raise ValueError("reward_service_transform_scale must be positive for log1p")
+        if self.reward_tacc_transform == "log1p" and self.reward_tacc_transform_scale <= 0:
+            raise ValueError("reward_tacc_transform_scale must be positive for log1p")
+        if self.reward_potential_lost_weight < 0:
+            raise ValueError("reward_potential_lost_weight must be >= 0")
 
 
 @dataclass
@@ -124,6 +152,11 @@ class EventDrivenEnv:
         self._precompute_k_hop_neighbors()  # Precompute for k_hop mode
         self._load_requests()
         self.reset()
+
+    def seed(self, seed: int) -> None:
+        """Reset RNG seed for deterministic evaluation runs."""
+        self.config.seed = int(seed)
+        self.rng = np.random.default_rng(self.config.seed)
 
     def _load_graph(self) -> None:
         nodes = pd.read_parquet(self.config.graph_nodes_path)
@@ -211,6 +244,99 @@ class EventDrivenEnv:
                     continue
                 shortest[src_idx, dst_idx] = float(dist)
         self.shortest_time_sec = shortest
+
+    def _apply_positive_reward_transform(self, value: float, transform: str, scale: float) -> float:
+        if transform == "none":
+            return float(value)
+        if value <= 0:
+            return float(value)
+        if transform == "log1p":
+            scale = max(float(scale), 1e-6)
+            return float(scale * np.log1p(value / scale))
+        raise ValueError(f"Unknown reward transform: {transform}")
+
+    def _compute_waiting_remaining(self) -> float:
+        return float(sum(len(q) for q in self.waiting.values()))
+
+    def _compute_onboard_remaining(self) -> float:
+        return float(sum(len(v.onboard) for v in self.vehicles))
+
+    def _compute_backlog_scalar(self) -> float:
+        return self._compute_waiting_remaining() + self._compute_onboard_remaining()
+
+    def _compute_lost_total(self) -> float:
+        return float(
+            self.waiting_churned
+            + self.onboard_churned
+            + self.structurally_unserviceable
+        )
+
+    def _compute_phi(self, backlog_scalar: float) -> float:
+        lost_total = self._compute_lost_total()
+        return float(backlog_scalar + self.config.reward_potential_lost_weight * lost_total)
+
+    def _snapshot_potential(self) -> Dict[str, float]:
+        waiting_remaining = self._compute_waiting_remaining()
+        onboard_remaining = self._compute_onboard_remaining()
+        backlog_scalar = waiting_remaining + onboard_remaining
+        lost_total = self._compute_lost_total()
+        phi = self._compute_phi(backlog_scalar)
+        return {
+            "waiting_remaining": float(waiting_remaining),
+            "onboard_remaining": float(onboard_remaining),
+            "phi_backlog": float(backlog_scalar),
+            "phi": float(phi),
+            "lost_total": float(lost_total),
+            "waiting_churned": float(self.waiting_churned),
+            "onboard_churned": float(self.onboard_churned),
+            "structural_unserviceable": float(self.structurally_unserviceable),
+        }
+
+    def get_potential_debug(self) -> Dict[str, float]:
+        """Return a consistent potential snapshot for debug/fallback paths."""
+        snap = self._snapshot_potential()
+        return {
+            "reward_potential_alpha": float(self.config.reward_potential_alpha),
+            "reward_potential_alpha_source": str(self.config.reward_potential_alpha_source),
+            "reward_potential_lost_weight": float(self.config.reward_potential_lost_weight),
+            "reward_potential_scale_with_reward_scale": bool(self.config.reward_potential_scale_with_reward_scale),
+            "phi_before": float(snap["phi"]),
+            "phi_after": float(snap["phi"]),
+            "phi_delta": 0.0,
+            "phi_backlog_before": float(snap["phi_backlog"]),
+            "phi_backlog_after": float(snap["phi_backlog"]),
+            "lost_total_before": float(snap["lost_total"]),
+            "lost_total_after": float(snap["lost_total"]),
+            "waiting_churned_before": float(snap["waiting_churned"]),
+            "waiting_churned_after": float(snap["waiting_churned"]),
+            "onboard_churned_before": float(snap["onboard_churned"]),
+            "onboard_churned_after": float(snap["onboard_churned"]),
+            "structural_unserviceable_before": float(snap["structural_unserviceable"]),
+            "structural_unserviceable_after": float(snap["structural_unserviceable"]),
+            "waiting_remaining_before": float(snap["waiting_remaining"]),
+            "waiting_remaining_after": float(snap["waiting_remaining"]),
+            "onboard_remaining_before": float(snap["onboard_remaining"]),
+            "onboard_remaining_after": float(snap["onboard_remaining"]),
+            "reward_potential_shaping": 0.0,
+            "reward_potential_shaping_raw": 0.0,
+        }
+
+    @staticmethod
+    def compute_potential_shaping(
+        reward_potential_alpha: float,
+        phi_before: float,
+        phi_after: float,
+        reward_scale: float,
+        scale_with_reward_scale: bool,
+    ) -> Dict[str, float]:
+        phi_delta = float(phi_before - phi_after)
+        shaping_raw = float(reward_potential_alpha) * phi_delta
+        shaping_scaled = float(shaping_raw) * float(reward_scale) if scale_with_reward_scale else float(shaping_raw)
+        return {
+            "phi_delta": phi_delta,
+            "reward_potential_shaping_raw": shaping_raw,
+            "reward_potential_shaping": shaping_scaled,
+        }
 
     def _k_hop_nodes(self, center: int, k: int) -> List[int]:
         if k <= 0:
@@ -741,7 +867,7 @@ class EventDrivenEnv:
             return float("inf")
         return float(self.shortest_time_sec[src_idx, dst_idx])
 
-    def _apply_churn(self) -> Tuple[int, int, float, float, float, List[float], List[int], List[int]]:
+    def _apply_churn(self) -> Tuple[int, int, float, float, float, List[float], List[int], List[int], int]:
         churned = 0
         timeout = 0
         churn_prob_sum = 0.0
@@ -749,6 +875,7 @@ class EventDrivenEnv:
         churn_probs: List[float] = []
         churned_ids: List[int] = []
         timeout_ids: List[int] = []
+        prob_count = 0
         for stop_id, queue in self.waiting.items():
             remain = []
             for req in queue:
@@ -765,6 +892,7 @@ class EventDrivenEnv:
                 churn_prob_sum += float(prob)
                 churn_probs.append(float(prob))
                 churn_prob_weighted_sum += float(prob) * self.fairness_weight.get(int(stop_id), 1.0)
+                prob_count += 1
                 if self.rng.random() < prob:
                     churned += 1
                     req["cancel_reason"] = "probabilistic_churn"
@@ -775,13 +903,14 @@ class EventDrivenEnv:
                     remain.append(req)
             self.waiting[stop_id] = remain
         cvar = self._cvar(churn_probs)
-        return churned, timeout, churn_prob_sum, churn_prob_weighted_sum, cvar, churn_probs, churned_ids, timeout_ids
+        return churned, timeout, churn_prob_sum, churn_prob_weighted_sum, cvar, churn_probs, churned_ids, timeout_ids, prob_count
 
-    def _apply_onboard_churn(self, vehicle: VehicleState) -> Tuple[int, float, List[float], List[int]]:
+    def _apply_onboard_churn(self, vehicle: VehicleState) -> Tuple[int, float, List[float], List[int], int]:
         churned = 0
         prob_sum = 0.0
         churn_probs: List[float] = []
         churned_ids: List[int] = []
+        prob_count = 0
         remain = []
         for pax in vehicle.onboard:
             elapsed = self.current_time - pax["pickup_time_sec"]
@@ -789,6 +918,7 @@ class EventDrivenEnv:
             prob = self._onboard_churn_prob(delay_over_direct)
             prob_sum += float(prob)
             churn_probs.append(float(prob))
+            prob_count += 1
             if self.rng.random() < prob:
                 churned += 1
                 pax["cancel_reason"] = "onboard_churn"
@@ -798,7 +928,7 @@ class EventDrivenEnv:
             else:
                 remain.append(pax)
         vehicle.onboard = remain
-        return churned, prob_sum, churn_probs, churned_ids
+        return churned, prob_sum, churn_probs, churned_ids, prob_count
 
     def _handle_vehicle_arrival(
         self, vehicle: VehicleState
@@ -820,10 +950,17 @@ class EventDrivenEnv:
             self._transition(pax, "served", reason="dropoff")
             self.dropoff_count_by_stop[int(vehicle.current_stop)] += 1
 
-        onboard_churned, onboard_prob_sum, onboard_probs, onboard_churned_ids = self._apply_onboard_churn(vehicle)
+        (
+            onboard_churned,
+            onboard_prob_sum,
+            onboard_probs,
+            onboard_churned_ids,
+            onboard_prob_count,
+        ) = self._apply_onboard_churn(vehicle)
         self.onboard_churned += onboard_churned
         self._step_stats["onboard_churned"] += onboard_churned
         self._step_stats["onboard_churn_prob_sum"] += onboard_prob_sum
+        self._step_stats["onboard_churn_count"] += onboard_prob_count
         self._step_stats["onboard_churn_probs"].extend(onboard_probs)
 
         capacity_left = max(0, self.config.vehicle_capacity - len(vehicle.onboard))
@@ -857,6 +994,12 @@ class EventDrivenEnv:
             )
 
     def _advance_until_ready(self) -> None:
+        # If there are already ready vehicles queued (e.g., multiple arrivals at the same sim_time),
+        # we must pick one immediately. Otherwise the simulator can "stall" at a fixed time while
+        # the trainer keeps issuing actions, producing 0 served/churn and flat metrics.
+        if self.active_vehicle_id is None and self.ready_vehicle_ids:
+            self.active_vehicle_id = self.ready_vehicle_ids.pop(0)
+            return
         while not self.ready_vehicle_ids and not self.done:
             if not self.event_queue:
                 self.done = True
@@ -910,6 +1053,7 @@ class EventDrivenEnv:
                 churn_probs,
                 churned_ids,
                 timeout_ids,
+                churn_prob_count,
             ) = self._apply_churn()
             self.waiting_churned += churned
             self.waiting_timeouts += timeout
@@ -917,6 +1061,7 @@ class EventDrivenEnv:
             self._step_stats["waiting_timeouts"] += timeout
             self._step_stats["waiting_churn_prob_sum"] += churn_prob_sum
             self._step_stats["waiting_churn_prob_weighted_sum"] += churn_prob_weighted_sum
+            self._step_stats["waiting_churn_count"] += churn_prob_count
             self._step_stats["waiting_churn_probs"].extend(churn_probs)
             self._step_stats["waiting_churn_cvar"] = self._cvar(self._step_stats["waiting_churn_probs"])
             self._log_event(
@@ -929,8 +1074,20 @@ class EventDrivenEnv:
                     "timeout_ids": timeout_ids,
                 },
             )
-        if self.ready_vehicle_ids:
+            if self.active_vehicle_id is None and self.ready_vehicle_ids:
+                self.active_vehicle_id = self.ready_vehicle_ids.pop(0)
+                return
+
+        if self.active_vehicle_id is None and self.ready_vehicle_ids:
             self.active_vehicle_id = self.ready_vehicle_ids.pop(0)
+
+    def _has_future_orders(self) -> bool:
+        return any(event_type == EVENT_ORDER for _, _, _, event_type, _ in self.event_queue)
+
+    def _no_pending_requests(self) -> bool:
+        waiting_remaining = sum(len(q) for q in self.waiting.values())
+        onboard_remaining = sum(len(v.onboard) for v in self.vehicles)
+        return waiting_remaining == 0 and onboard_remaining == 0
 
     def _get_active_vehicle(self) -> VehicleState | None:
         if self.active_vehicle_id is None:
@@ -994,12 +1151,53 @@ class EventDrivenEnv:
                         "violations": violations,
                     }
                 )
+        if not self.config.allow_stop_when_actions_exist:
+            stop_indices = [idx for idx, dst in enumerate(actions) if int(dst) == int(vehicle.current_stop)]
+            if stop_indices:
+                other_feasible = any(
+                    bool(mask[idx]) for idx in range(len(mask)) if idx not in stop_indices
+                )
+                if other_feasible:
+                    for idx in stop_indices:
+                        if mask[idx]:
+                            mask[idx] = False
+                            debug_entries.append(
+                                {
+                                    "action": int(actions[idx]),
+                                    "vehicle_id": int(vehicle.vehicle_id),
+                                    "violations": [{"type": "noop_disallowed"}],
+                                }
+                            )
+        if actions and not any(mask):
+            if int(vehicle.current_stop) in actions:
+                stop_idx = actions.index(int(vehicle.current_stop))
+                mask[stop_idx] = True
+                debug_entries.append(
+                    {
+                        "action": int(actions[stop_idx]),
+                        "vehicle_id": int(vehicle.vehicle_id),
+                        "violations": [{"type": "noop_fallback"}],
+                    }
+                )
+            else:
+                actions.append(int(vehicle.current_stop))
+                mask.append(True)
+                debug_entries.append(
+                    {
+                        "action": int(vehicle.current_stop),
+                        "vehicle_id": int(vehicle.vehicle_id),
+                        "violations": [{"type": "noop_fallback"}],
+                    }
+                )
         if debug or self.config.debug_mask:
             self.last_mask_debug = debug_entries
         return actions, mask
 
     def get_feature_batch(self, k_hop: int | None = None) -> Dict[str, np.ndarray]:
         vehicle = self._get_active_vehicle()
+        if vehicle is None:
+            self._advance_until_ready()
+            vehicle = self._get_active_vehicle()
         if vehicle is None:
             node_features = np.zeros((len(self.stop_ids), 5), dtype=np.float32)
             stop_index = {stop_id: idx for idx, stop_id in enumerate(self.stop_ids)}
@@ -1155,6 +1353,118 @@ class EventDrivenEnv:
         if self.done:
             raise RuntimeError("Episode is done, call reset()")
         self._step_stats = self._init_step_stats()
+        before_snapshot = self._snapshot_potential()
+        waiting_remaining_before = before_snapshot["waiting_remaining"]
+        onboard_remaining_before = before_snapshot["onboard_remaining"]
+        phi_backlog_before = before_snapshot["phi_backlog"]
+        phi_before = before_snapshot["phi"]
+        lost_total_before = before_snapshot["lost_total"]
+        waiting_churned_before = before_snapshot["waiting_churned"]
+        onboard_churned_before = before_snapshot["onboard_churned"]
+        structural_before = before_snapshot["structural_unserviceable"]
+        if self.config.max_sim_time_sec is not None and self.current_time >= float(self.config.max_sim_time_sec):
+            self.done = True
+            after_snapshot = self._snapshot_potential()
+            waiting_remaining = after_snapshot["waiting_remaining"]
+            onboard_remaining = after_snapshot["onboard_remaining"]
+            info = {
+                "done_reason": "max_sim_time",
+                "waiting_remaining": waiting_remaining,
+                "onboard_remaining": onboard_remaining,
+                "reward_potential_alpha": float(self.config.reward_potential_alpha),
+                "reward_potential_alpha_source": str(self.config.reward_potential_alpha_source),
+                "reward_potential_lost_weight": float(self.config.reward_potential_lost_weight),
+                "reward_potential_scale_with_reward_scale": bool(
+                    self.config.reward_potential_scale_with_reward_scale
+                ),
+                "phi_before": float(phi_before),
+                "phi_after": float(after_snapshot["phi"]),
+                "phi_delta": 0.0,
+                "phi_backlog_before": float(phi_backlog_before),
+                "phi_backlog_after": float(after_snapshot["phi_backlog"]),
+                "lost_total_before": float(lost_total_before),
+                "lost_total_after": float(after_snapshot["lost_total"]),
+                "waiting_churned_before": float(waiting_churned_before),
+                "waiting_churned_after": float(after_snapshot["waiting_churned"]),
+                "onboard_churned_before": float(onboard_churned_before),
+                "onboard_churned_after": float(after_snapshot["onboard_churned"]),
+                "structural_unserviceable_before": float(structural_before),
+                "structural_unserviceable_after": float(after_snapshot["structural_unserviceable"]),
+                "waiting_remaining_before": float(waiting_remaining_before),
+                "onboard_remaining_before": float(onboard_remaining_before),
+                "waiting_remaining_after": float(waiting_remaining),
+                "onboard_remaining_after": float(onboard_remaining),
+                "reward_potential_shaping": 0.0,
+                "reward_potential_shaping_raw": 0.0,
+                "reward_components": {
+                    "reward_base_service": 0.0,
+                    "reward_waiting_churn_penalty": 0.0,
+                    "reward_fairness_penalty": 0.0,
+                    "reward_cvar_penalty": 0.0,
+                    "reward_travel_cost": 0.0,
+                    "reward_onboard_delay_penalty": 0.0,
+                    "reward_onboard_churn_penalty": 0.0,
+                    "reward_backlog_penalty": 0.0,
+                    "reward_waiting_time_penalty": 0.0,
+                    "reward_potential_shaping": 0.0,
+                    "reward_congestion_penalty": 0.0,
+                    "reward_tacc_bonus": 0.0,
+                },
+                "reward_components_raw": {"reward_potential_shaping_raw": 0.0},
+            }
+            return self._observe(), 0.0, True, info
+        if (
+            self.current_time >= float(self.config.demand_exhausted_min_time_sec)
+            and self._no_pending_requests()
+            and not self._has_future_orders()
+        ):
+            self.done = True
+            info = {
+                "done_reason": "demand_exhausted",
+                "waiting_remaining": 0.0,
+                "onboard_remaining": 0.0,
+                "reward_potential_alpha": float(self.config.reward_potential_alpha),
+                "reward_potential_alpha_source": str(self.config.reward_potential_alpha_source),
+                "reward_potential_lost_weight": float(self.config.reward_potential_lost_weight),
+                "reward_potential_scale_with_reward_scale": bool(
+                    self.config.reward_potential_scale_with_reward_scale
+                ),
+                "phi_before": float(phi_before),
+                "phi_after": 0.0,
+                "phi_delta": float(phi_before),
+                "phi_backlog_before": float(phi_backlog_before),
+                "phi_backlog_after": 0.0,
+                "lost_total_before": float(lost_total_before),
+                "lost_total_after": 0.0,
+                "waiting_churned_before": float(waiting_churned_before),
+                "waiting_churned_after": 0.0,
+                "onboard_churned_before": float(onboard_churned_before),
+                "onboard_churned_after": 0.0,
+                "structural_unserviceable_before": float(structural_before),
+                "structural_unserviceable_after": 0.0,
+                "waiting_remaining_before": float(waiting_remaining_before),
+                "onboard_remaining_before": float(onboard_remaining_before),
+                "waiting_remaining_after": 0.0,
+                "onboard_remaining_after": 0.0,
+                "reward_potential_shaping": 0.0,
+                "reward_potential_shaping_raw": 0.0,
+                "reward_components": {
+                    "reward_base_service": 0.0,
+                    "reward_waiting_churn_penalty": 0.0,
+                    "reward_fairness_penalty": 0.0,
+                    "reward_cvar_penalty": 0.0,
+                    "reward_travel_cost": 0.0,
+                    "reward_onboard_delay_penalty": 0.0,
+                    "reward_onboard_churn_penalty": 0.0,
+                    "reward_backlog_penalty": 0.0,
+                    "reward_waiting_time_penalty": 0.0,
+                    "reward_potential_shaping": 0.0,
+                    "reward_congestion_penalty": 0.0,
+                    "reward_tacc_bonus": 0.0,
+                },
+                "reward_components_raw": {"reward_potential_shaping_raw": 0.0},
+            }
+            return self._observe(), 0.0, True, info
         vehicle = self._get_active_vehicle()
         if vehicle is None:
             self._advance_until_ready()
@@ -1164,8 +1474,9 @@ class EventDrivenEnv:
                     self._refresh_fleet_density_map(record_history=True)
                 self.done = True
                 # Populate info for early-return path
-                waiting_remaining = float(sum(len(q) for q in self.waiting.values()))
-                onboard_remaining = float(sum(len(v.onboard) for v in self.vehicles))
+                after_snapshot = self._snapshot_potential()
+                waiting_remaining = after_snapshot["waiting_remaining"]
+                onboard_remaining = after_snapshot["onboard_remaining"]
                 info = {
                     "done_reason": "no_valid_action",
                     "waiting_remaining": waiting_remaining,
@@ -1174,6 +1485,46 @@ class EventDrivenEnv:
                     "reward_congestion_penalty": 0.0,
                     "dst_density_raw": 0.0,
                     "fleet_potential_dst": 0.0,
+                    "reward_potential_alpha": float(self.config.reward_potential_alpha),
+                    "reward_potential_alpha_source": str(self.config.reward_potential_alpha_source),
+                    "reward_potential_lost_weight": float(self.config.reward_potential_lost_weight),
+                    "reward_potential_scale_with_reward_scale": bool(
+                        self.config.reward_potential_scale_with_reward_scale
+                    ),
+                    "phi_before": float(phi_before),
+                    "phi_after": float(after_snapshot["phi"]),
+                    "phi_delta": float(phi_before - after_snapshot["phi"]),
+                    "phi_backlog_before": float(phi_backlog_before),
+                    "phi_backlog_after": float(after_snapshot["phi_backlog"]),
+                    "lost_total_before": float(lost_total_before),
+                    "lost_total_after": float(after_snapshot["lost_total"]),
+                    "waiting_churned_before": float(waiting_churned_before),
+                    "waiting_churned_after": float(after_snapshot["waiting_churned"]),
+                    "onboard_churned_before": float(onboard_churned_before),
+                    "onboard_churned_after": float(after_snapshot["onboard_churned"]),
+                    "structural_unserviceable_before": float(structural_before),
+                    "structural_unserviceable_after": float(after_snapshot["structural_unserviceable"]),
+                    "waiting_remaining_before": float(waiting_remaining_before),
+                    "onboard_remaining_before": float(onboard_remaining_before),
+                    "waiting_remaining_after": float(waiting_remaining),
+                    "onboard_remaining_after": float(onboard_remaining),
+                    "reward_potential_shaping": 0.0,
+                    "reward_potential_shaping_raw": 0.0,
+                    "reward_components": {
+                        "reward_base_service": 0.0,
+                        "reward_waiting_churn_penalty": 0.0,
+                        "reward_fairness_penalty": 0.0,
+                        "reward_cvar_penalty": 0.0,
+                        "reward_travel_cost": 0.0,
+                        "reward_onboard_delay_penalty": 0.0,
+                        "reward_onboard_churn_penalty": 0.0,
+                        "reward_backlog_penalty": 0.0,
+                        "reward_waiting_time_penalty": 0.0,
+                        "reward_potential_shaping": 0.0,
+                        "reward_congestion_penalty": 0.0,
+                        "reward_tacc_bonus": 0.0,
+                    },
+                    "reward_components_raw": {"reward_potential_shaping_raw": 0.0},
                 }
                 self._append_fleet_density_summary(info)
                 self._append_episode_density_metrics(info)
@@ -1183,8 +1534,25 @@ class EventDrivenEnv:
             self._refresh_fleet_density_map(record_history=True)
 
         neighbor_actions = [dst for dst, _ in self.neighbors.get(vehicle.current_stop, [])]
+        wait_action = False
         if action not in neighbor_actions:
-            raise ValueError(f"Action {action} not in neighbor set for stop {vehicle.current_stop}")
+            if int(action) == int(vehicle.current_stop):
+                wait_action = True
+            else:
+                raise ValueError(f"Action {action} not in neighbor set for stop {vehicle.current_stop}")
+        if not self.config.allow_stop_when_actions_exist and int(action) == int(vehicle.current_stop):
+            actions, mask = self.get_action_mask(debug=self.config.debug_mask)
+            if actions:
+                try:
+                    stop_idx = actions.index(int(action))
+                except ValueError:
+                    stop_idx = None
+                if stop_idx is not None:
+                    other_feasible = any(
+                        bool(mask[idx]) for idx in range(len(mask)) if idx != stop_idx
+                    )
+                    if other_feasible:
+                        raise ValueError("NOOP action is disallowed when feasible actions exist")
         
         # Debug模式：验证动作是否违反mask约束
         if self.config.debug_mask:
@@ -1203,7 +1571,13 @@ class EventDrivenEnv:
 
         travel_time = dict(self.neighbors.get(vehicle.current_stop, [])).get(action)
         if travel_time is None:
-            raise ValueError("Missing travel time for action")
+            if wait_action and self.event_queue:
+                next_time = float(self.event_queue[0][0])
+                travel_time = max(0.0, next_time - float(self.current_time))
+            elif wait_action:
+                travel_time = 0.0
+            else:
+                raise ValueError("Missing travel time for action")
 
         arrival_time = self.current_time + travel_time
         self._log_event(
@@ -1220,6 +1594,8 @@ class EventDrivenEnv:
         vehicle.available_time = arrival_time
         self._schedule_event(arrival_time, EVENT_VEHICLE_ARRIVAL, {"vehicle_id": int(vehicle.vehicle_id)})
         self.steps += 1
+        # Consume the current decision. The next decision must come from the ready-queue or a future event.
+        self.active_vehicle_id = None
         self._advance_until_ready()
 
         reward_base_service = self.config.reward_service * self._step_stats["served"]
@@ -1232,6 +1608,58 @@ class EventDrivenEnv:
         reward_onboard_delay = self.config.reward_onboard_delay_weight * self._step_stats["onboard_delay_prob_sum"]
         reward_onboard_churn = self.config.reward_onboard_churn_penalty * self._step_stats["onboard_churn_prob_sum"]
         reward_tacc = self.config.reward_tacc_weight * self._step_stats["tacc_gain"]
+        reward_base_service = self._apply_positive_reward_transform(
+            reward_base_service,
+            self.config.reward_service_transform,
+            self.config.reward_service_transform_scale,
+        )
+        reward_tacc = self._apply_positive_reward_transform(
+            reward_tacc,
+            self.config.reward_tacc_transform,
+            self.config.reward_tacc_transform_scale,
+        )
+
+        after_snapshot = self._snapshot_potential()
+        waiting_remaining = after_snapshot["waiting_remaining"]
+        onboard_remaining = after_snapshot["onboard_remaining"]
+        phi_backlog_after = after_snapshot["phi_backlog"]
+        phi_after = after_snapshot["phi"]
+        phi_delta = float(phi_before - phi_after)
+        lost_total_after = after_snapshot["lost_total"]
+        waiting_churned_after = after_snapshot["waiting_churned"]
+        onboard_churned_after = after_snapshot["onboard_churned"]
+        structural_after = after_snapshot["structural_unserviceable"]
+        reward_backlog = self.config.reward_step_backlog_penalty * (waiting_remaining + onboard_remaining)
+        waiting_time_sec = 0.0
+        if self.config.reward_waiting_time_penalty_per_sec > 0.0:
+            for queue in self.waiting.values():
+                for req in queue:
+                    waiting_time_sec += max(0.0, self.current_time - float(req["request_time_sec"]))
+        reward_waiting_time = self.config.reward_waiting_time_penalty_per_sec * waiting_time_sec
+        potential = self.compute_potential_shaping(
+            self.config.reward_potential_alpha,
+            phi_before,
+            phi_after,
+            float(self.config.reward_scale),
+            bool(self.config.reward_potential_scale_with_reward_scale),
+        )
+        reward_potential_shaping_raw = potential["reward_potential_shaping_raw"]
+        reward_potential_shaping = potential["reward_potential_shaping"]
+
+        scale = float(self.config.reward_scale)
+        if scale != 1.0:
+            reward_base_service *= scale
+            reward_waiting_churn *= scale
+            reward_fairness *= scale
+            reward_cvar *= scale
+            reward_travel_cost *= scale
+            reward_onboard_delay *= scale
+            reward_onboard_churn *= scale
+            reward_tacc *= scale
+            reward_backlog *= scale
+            reward_waiting_time *= scale
+            if not self.config.reward_potential_scale_with_reward_scale:
+                reward_potential_shaping *= 1.0
 
         dst_density_raw = 0.0
         fleet_potential_dst = 0.0
@@ -1242,19 +1670,37 @@ class EventDrivenEnv:
             fleet_potential_dst = float(self._apply_fleet_potential_phi(dst_density_raw))
             reward_congestion = float(self.config.reward_congestion_penalty * fleet_potential_dst)
 
-        reward = (
-            reward_base_service
-            - reward_waiting_churn
-            - reward_fairness
-            - reward_cvar
-            - reward_travel_cost
-            - reward_onboard_delay
-            - reward_onboard_churn
-            + reward_tacc
-        )
-        reward -= reward_congestion
+        reward_components = {
+            "reward_base_service": float(reward_base_service),
+            "reward_waiting_churn_penalty": float(-reward_waiting_churn),
+            "reward_fairness_penalty": float(-reward_fairness),
+            "reward_cvar_penalty": float(-reward_cvar),
+            "reward_travel_cost": float(-reward_travel_cost),
+            "reward_onboard_delay_penalty": float(-reward_onboard_delay),
+            "reward_onboard_churn_penalty": float(-reward_onboard_churn),
+            "reward_backlog_penalty": float(-reward_backlog),
+            "reward_waiting_time_penalty": float(-reward_waiting_time),
+            "reward_potential_shaping": float(reward_potential_shaping),
+            "reward_congestion_penalty": float(-reward_congestion),
+            "reward_tacc_bonus": float(reward_tacc),
+        }
+        reward_components_raw = {
+            "reward_potential_shaping_raw": float(reward_potential_shaping_raw),
+        }
+        reward = float(sum(reward_components.values()))
         if self.steps >= self.config.max_horizon_steps:
             self.done = True
+        if self.config.max_sim_time_sec is not None and self.current_time >= float(self.config.max_sim_time_sec):
+            self.done = True
+
+        waiting_churn_count = float(self._step_stats["waiting_churn_count"])
+        onboard_churn_count = float(self._step_stats["onboard_churn_count"])
+        waiting_churn_prob_mean = float(
+            self._step_stats["waiting_churn_prob_sum"] / max(1.0, waiting_churn_count)
+        )
+        onboard_churn_prob_mean = float(
+            self._step_stats["onboard_churn_prob_sum"] / max(1.0, onboard_churn_count)
+        )
 
         info = {
             "served": float(self.served),
@@ -1274,8 +1720,12 @@ class EventDrivenEnv:
             "step_waiting_churn_prob_sum": float(self._step_stats["waiting_churn_prob_sum"]),
             "step_waiting_churn_prob_weighted_sum": float(self._step_stats["waiting_churn_prob_weighted_sum"]),
             "step_waiting_churn_cvar": float(self._step_stats["waiting_churn_cvar"]),
+            "step_waiting_churn_count": float(waiting_churn_count),
+            "step_waiting_churn_prob_mean": float(waiting_churn_prob_mean),
             "step_onboard_delay_prob_sum": float(self._step_stats["onboard_delay_prob_sum"]),
             "step_onboard_churn_prob_sum": float(self._step_stats["onboard_churn_prob_sum"]),
+            "step_onboard_churn_count": float(onboard_churn_count),
+            "step_onboard_churn_prob_mean": float(onboard_churn_prob_mean),
             "step_tacc_gain": float(self._step_stats["tacc_gain"]),
             "step_boarded": float(self._step_stats["boarded"]),
             "step_denied_boarding": float(self._step_stats["denied_boarding"]),
@@ -1287,22 +1737,51 @@ class EventDrivenEnv:
             "reward_travel_cost": float(reward_travel_cost),
             "reward_onboard_delay_penalty": float(reward_onboard_delay),
             "reward_onboard_churn_penalty": float(reward_onboard_churn),
+            "reward_backlog_penalty": float(reward_backlog),
+            "reward_waiting_time_penalty": float(reward_waiting_time),
+            "reward_potential_shaping": float(reward_potential_shaping),
+            "reward_potential_shaping_raw": float(reward_potential_shaping_raw),
             "reward_congestion_penalty": float(reward_congestion),
             "reward_tacc_bonus": float(reward_tacc),
+            "reward_scale": float(self.config.reward_scale),
+            "reward_potential_alpha": float(self.config.reward_potential_alpha),
+            "reward_potential_alpha_source": str(self.config.reward_potential_alpha_source),
+            "reward_potential_lost_weight": float(self.config.reward_potential_lost_weight),
+            "reward_potential_scale_with_reward_scale": bool(self.config.reward_potential_scale_with_reward_scale),
+            "phi_before": float(phi_before),
+            "phi_after": float(phi_after),
+            "phi_delta": float(phi_delta),
+            "phi_backlog_before": float(phi_backlog_before),
+            "phi_backlog_after": float(phi_backlog_after),
+            "lost_total_before": float(lost_total_before),
+            "lost_total_after": float(lost_total_after),
+            "waiting_churned_before": float(waiting_churned_before),
+            "waiting_churned_after": float(waiting_churned_after),
+            "onboard_churned_before": float(onboard_churned_before),
+            "onboard_churned_after": float(onboard_churned_after),
+            "structural_unserviceable_before": float(structural_before),
+            "structural_unserviceable_after": float(structural_after),
+            "waiting_remaining_before": float(waiting_remaining_before),
+            "onboard_remaining_before": float(onboard_remaining_before),
+            "waiting_remaining_after": float(waiting_remaining),
+            "onboard_remaining_after": float(onboard_remaining),
             "dst_density_raw": float(dst_density_raw),
             "fleet_potential_dst": float(fleet_potential_dst),
             "reward_total": float(reward),
+            "reward_components": dict(reward_components),
+            "reward_components_raw": dict(reward_components_raw),
         }
         
         # Add backlog fields (always available)
-        waiting_remaining = float(sum(len(q) for q in self.waiting.values()))
-        onboard_remaining = float(sum(len(v.onboard) for v in self.vehicles))
+        info["step_waiting_time_sec"] = float(waiting_time_sec)
         info["waiting_remaining"] = waiting_remaining
         info["onboard_remaining"] = onboard_remaining
         
         if self.done:
             # Determine done_reason
-            if self.steps >= self.config.max_horizon_steps:
+            if self.config.max_sim_time_sec is not None and self.current_time >= float(self.config.max_sim_time_sec):
+                done_reason = "max_sim_time"
+            elif self.steps >= self.config.max_horizon_steps:
                 done_reason = "max_horizon"
             elif not self.event_queue:
                 done_reason = "event_queue_empty"
@@ -1343,9 +1822,11 @@ class EventDrivenEnv:
             "waiting_churn_prob_sum": 0.0,
             "waiting_churn_prob_weighted_sum": 0.0,
             "waiting_churn_cvar": 0.0,
+            "waiting_churn_count": 0.0,
             "waiting_churn_probs": [],
             "onboard_delay_prob_sum": 0.0,
             "onboard_churn_prob_sum": 0.0,
+            "onboard_churn_count": 0.0,
             "onboard_churn_probs": [],
             "tacc_gain": 0.0,
             "boarded": 0.0,

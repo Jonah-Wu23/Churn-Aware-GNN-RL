@@ -52,6 +52,15 @@ env:
   reward_cvar_penalty: 0.5
   reward_fairness_weight: 0.1
   reward_congestion_penalty: 0.0
+  demand_exhausted_min_time_sec: 300.0
+  reward_scale: 50.0
+  reward_step_backlog_penalty: 0.005
+  reward_waiting_time_penalty_per_sec: 0.00005
+  reward_potential_alpha: 0.0
+  reward_potential_lost_weight: 0.0
+  reward_potential_scale_with_reward_scale: true
+  debug_abort_on_alert: true
+  debug_dump_dir: "reports/debug/potential_alerts"
   cvar_alpha: 0.95
   fairness_gamma: 1.0
   od_glob: "data/processed/od_mapped/*.parquet"
@@ -75,7 +84,7 @@ train:
   total_steps: 200000
   buffer_size: 100000
   batch_size: 128
-  learning_starts: 5000
+  learning_starts: 10000
   train_freq: 4
   gradient_steps: 1
   target_update_interval: 2000
@@ -96,6 +105,21 @@ train:
   checkpoint_every_steps: 10000
   device: cuda
   use_amp: true
+  viz:
+    enabled: true
+    zmq_url: "tcp://0.0.0.0:6008"
+    publish_every_steps: 5
+    publish_on_episode_end: true
+    bind: true
+    alerts:
+      enabled: true
+      debug_abort_on_alert: true
+      abort_levels: ["high"]
+      debug_dump_dir: "reports/debug/potential_alerts"
+      alert_buffer_size: 50
+      no_service_positive_reward_epsilon: 0.1
+      entropy_warning_floor: 0.1
+      entropy_warning_patience: 50
 
 model:
   node_dim: 5
@@ -170,14 +194,21 @@ sumo:
 curriculum:
   stages: [L0, L1, L2, L3]
   strict_stage_params: true  # Fail-fast mode for unrecognized stage_params fields
-  trigger_rho: 0.4
+  trigger_rho: 0.25
   gamma: 1.0
   stage_max_steps: 50000
+  stage_steps:
+    L0: 10000
   stage_min_episodes: 3
   
   # Rho-gated transition settings
   rho_window_size: 5
   require_rho_transition: true
+  rho_gate_source: "auto"
+  stage_rho_gate_source:
+    L2: "train"
+  stage_require_rho:
+    L0: false
   stage_extension_steps: 30000
   max_stage_extensions: 2
   fail_policy: "fail_fast"
@@ -217,13 +248,13 @@ curriculum:
       end: 0.05
       decay_steps: 50000
     L2:
-      start: 0.1
-      end: 0.01
-      decay_steps: 50000
+      start: 1.0
+      end: 0.05
+      decay_steps: 80000
     L3:
-      start: 0.05
-      end: 0.001
-      decay_steps: 50000
+      start: 0.5
+      end: 0.3
+      decay_steps: 80000
   
   l3_two_stage:
     enabled: true
@@ -241,12 +272,18 @@ curriculum:
       reward_onboard_churn_penalty: 0.2
       reward_fairness_weight: 0.0
       reward_cvar_penalty: 0.0
+      reward_potential_alpha: 0.3
+      reward_potential_lost_weight: 1.0
+      reward_potential_scale_with_reward_scale: false
     phase2_env_overrides:
       reward_service: 4.0
       reward_waiting_churn_penalty: 0.2
       reward_onboard_churn_penalty: 0.5
       reward_fairness_weight: 0.5
       reward_cvar_penalty: 0.5
+      reward_potential_alpha: 0.1
+      reward_potential_lost_weight: 1.0
+      reward_potential_scale_with_reward_scale: false
     # Phase3 explicitly inherits from phase2 (never empty!)
     phase3_env_overrides:
       reward_service: 4.0
@@ -254,6 +291,9 @@ curriculum:
       reward_onboard_churn_penalty: 0.5
       reward_fairness_weight: 0.5
       reward_cvar_penalty: 0.5
+      reward_potential_alpha: 0.05
+      reward_potential_lost_weight: 1.0
+      reward_potential_scale_with_reward_scale: false
 
   stage_params:
     L0:
@@ -262,28 +302,61 @@ curriculum:
       churn_tol_override_sec: 1000000000
       env_overrides:
         reward_congestion_penalty: 0.0
+        reward_step_backlog_penalty: 0.0
+        reward_waiting_time_penalty_per_sec: 0.0
     L1:
       density_multiplier: 1.2
       time_scale: 0.8
       center_quantile: 0.3
       short_trip_quantile: 0.3
-      churn_tol_override_sec: 600
+      churn_tol_override_sec: 1200
       env_overrides:
-        reward_waiting_churn_penalty: 2.0
-        reward_terminal_backlog_penalty: 30.0
+        allow_stop_when_actions_exist: false
+        reward_waiting_churn_penalty: 1.0
+        reward_terminal_backlog_penalty: 10.0
+        reward_scale: 30.0
+        reward_service_transform: "log1p"
+        reward_service_transform_scale: 60.0
+        reward_tacc_transform: "log1p"
+        reward_tacc_transform_scale: 60.0
+        reward_step_backlog_penalty: 0.003
+        reward_waiting_time_penalty_per_sec: 0.00003
         reward_congestion_penalty: 0.05
-        max_horizon_steps: 8000
+        reward_potential_alpha: 0.3
+        reward_potential_lost_weight: 1.0
+        reward_potential_scale_with_reward_scale: false
+        debug_abort_on_alert: true
+        debug_dump_dir: "reports/debug/potential_alerts"
+        max_horizon_steps: 6000
+        max_sim_time_sec: 3600.0
     L2:
       density_multiplier: 1.2
-      time_scale: 0.7
+      time_scale: 0.8
       center_ratio: 0.8
       center_quantile: 0.3
       short_trip_quantile: 0.3
       edge_quantile: 0.7
       long_trip_quantile: 0.7
-      churn_tol_override_sec: 900
+      churn_tol_override_sec: 1200
       env_overrides:
+        allow_stop_when_actions_exist: false
+        reward_waiting_churn_penalty: 1.0
+        reward_terminal_backlog_penalty: 10.0
+        reward_scale: 30.0
+        reward_service_transform: "log1p"
+        reward_service_transform_scale: 60.0
+        reward_tacc_transform: "log1p"
+        reward_tacc_transform_scale: 60.0
+        reward_step_backlog_penalty: 0.003
+        reward_waiting_time_penalty_per_sec: 0.00003
         reward_congestion_penalty: 0.10
+        reward_potential_alpha: 0.05
+        reward_potential_lost_weight: 1.0
+        reward_potential_scale_with_reward_scale: false
+        debug_abort_on_alert: true
+        debug_dump_dir: "reports/debug/potential_alerts"
+        max_horizon_steps: 6000
+        max_sim_time_sec: 3600.0
     L3:
       density_multiplier: 1.0
       time_scale: 1.0

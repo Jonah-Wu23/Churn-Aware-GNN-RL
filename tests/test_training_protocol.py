@@ -207,5 +207,106 @@ class TestCurriculumConfig:
         assert cfg.rho_warning_threshold < cfg.trigger_rho
 
 
+class TestServiceRateConsistency:
+    """测试 service_rate 与 rho 的口径一致性。"""
+    
+    def test_service_rate_with_remaining(self):
+        """测试含 remaining 的 service_rate 计算。"""
+        from src.train.runner import _compute_service_rate, compute_eligible
+        log = {
+            "served": 33,
+            "waiting_churned": 13,
+            "onboard_churned": 0,
+            "waiting_timeouts": 0,
+            "waiting_remaining": 100,
+            "onboard_remaining": 47,
+        }
+        rate = _compute_service_rate(log)
+        eligible = compute_eligible(log)
+        # 33 / (33+13+0+0+100+47) = 33/193 ≈ 0.171
+        assert abs(eligible - 193) < 1e-6
+        assert abs(rate - 33/193) < 1e-6
+    
+    def test_rho_equals_service_rate_when_stuckness_zero(self):
+        """当 stuckness=0 时，rho 应等于 service_rate。"""
+        log = {
+            "served": 80,
+            "waiting_churned": 10,
+            "onboard_churned": 5,
+            "waiting_timeouts": 5,
+            "waiting_remaining": 0,
+            "onboard_remaining": 0,
+            "stuckness": 0.0,
+        }
+        service_rate = _compute_service_rate(log)
+        rho = _compute_rho(log, gamma=1.0)
+        assert abs(service_rate - rho) < 1e-6
+    
+    def test_service_rate_simple_excludes_remaining(self):
+        """测试 service_rate_simple 不含 remaining。"""
+        from src.train.runner import compute_service_rate_simple
+        log = {
+            "served": 33,
+            "waiting_churned": 13,
+            "onboard_churned": 0,
+            "waiting_timeouts": 0,
+            "waiting_remaining": 100,
+            "onboard_remaining": 47,
+        }
+        rate_simple = compute_service_rate_simple(log)
+        # 33 / (33+13+0+0) = 33/46 ≈ 0.717
+        assert abs(rate_simple - 33/46) < 1e-6
+    
+    def test_consistency_check_service_rate_from_rho(self):
+        """测试一致性校验派生量：service_rate == rho * (1 + gamma * stuckness)。"""
+        log = {
+            "served": 80,
+            "waiting_churned": 10,
+            "onboard_churned": 5,
+            "waiting_timeouts": 5,
+            "waiting_remaining": 0,
+            "onboard_remaining": 0,
+            "stuckness": 0.2,
+        }
+        service_rate = _compute_service_rate(log)
+        rho = _compute_rho(log, gamma=1.0)
+        stuckness = log["stuckness"]
+        
+        # 一致性校验
+        service_rate_from_rho = rho * (1.0 + 1.0 * stuckness)
+        assert abs(service_rate - service_rate_from_rho) < 1e-6
+    
+    def test_conservation_check_passes(self):
+        """测试守恒校验：eligible + structural == total_requests。"""
+        from src.train.runner import verify_request_conservation, compute_eligible
+        log = {
+            "served": 80,
+            "waiting_churned": 10,
+            "onboard_churned": 5,
+            "waiting_timeouts": 5,
+            "waiting_remaining": 10,
+            "onboard_remaining": 5,
+            "structural_unserviceable": 15,
+            "total_requests": 130,  # 80+10+5+5+10+5+15 = 130
+        }
+        assert verify_request_conservation(log) == True
+        assert abs(compute_eligible(log) + 15 - 130) < 1e-6
+    
+    def test_conservation_check_fails(self):
+        """测试守恒校验失败情况。"""
+        from src.train.runner import verify_request_conservation
+        log = {
+            "served": 80,
+            "waiting_churned": 10,
+            "onboard_churned": 5,
+            "waiting_timeouts": 5,
+            "waiting_remaining": 10,
+            "onboard_remaining": 5,
+            "structural_unserviceable": 15,
+            "total_requests": 100,  # 故意设置错误值
+        }
+        assert verify_request_conservation(log) == False
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -69,3 +69,40 @@ Notes:
 - Audit outputs are written under `reports/audit/`.
 
 See `docs/architecture.md`, `docs/requirements.md`, and `todos.md` for details.
+
+## Realtime visualization (EdgeQ)
+Enable realtime publishing in your training config:
+
+```yaml
+train:
+  viz:
+    enabled: true
+    zmq_url: "tcp://127.0.0.1:5555"
+    publish_every_steps: 5
+    publish_on_episode_end: true
+    bind: true
+    alerts:
+      reward_window: 50
+      reward_positive_threshold: 0.5
+      reward_delta_threshold: 0.2
+      low_service_steps: 20
+      low_service_threshold: 0.0
+      loop_window: 30
+      loop_unique_stops_max: 2
+      loop_max_served: 1
+      entropy_floor: 0.25
+      entropy_patience: 20
+      epsilon_floor: 0.2
+```
+
+Run the dashboard in a separate process:
+
+```bash
+python scripts/run_realtime_viz.py --config configs/manhattan.yaml --port 8050
+```
+
+Then start training:
+
+```bash
+python scripts/run_edgeq_train.py --config configs/manhattan.yaml
+```

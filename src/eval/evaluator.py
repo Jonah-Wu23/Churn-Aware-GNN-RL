@@ -60,18 +60,52 @@ def _compute_wait_times(env: EventDrivenEnv) -> List[float]:
 
 
 def _compute_metrics(env: EventDrivenEnv, total_tacc: float) -> Dict[str, float]:
+    """计算episode级别的统一指标。
+    
+    H2: 复用runner的公共函数，不自造分母。
+    """
+    # Import runner's public functions for unified metrics
+    from src.train.runner import (
+        compute_eligible,
+        compute_service_rate_simple,
+        _compute_service_rate,
+        verify_request_conservation,
+    )
+    
     total_requests = float(len(env.requests))
     structural = float(env.structurally_unserviceable)
     waiting_churned = float(env.waiting_churned)
     waiting_timeouts = float(env.waiting_timeouts)
     onboard_churned = float(env.onboard_churned)
     served = float(env.served)
-
+    
+    # Get remaining counts
+    waiting_remaining = float(sum(len(q) for q in env.waiting.values()))
+    onboard_remaining = float(sum(len(v.onboard) for v in env.fleet.values()))
+    
+    # Build episode log for unified functions
+    episode_log = {
+        "served": served,
+        "waiting_churned": waiting_churned,
+        "onboard_churned": onboard_churned,
+        "waiting_timeouts": waiting_timeouts,
+        "waiting_remaining": waiting_remaining,
+        "onboard_remaining": onboard_remaining,
+        "structural_unserviceable": structural,
+        "total_requests": total_requests,
+    }
+    
+    # Use unified functions
+    eligible_total = compute_eligible(episode_log)
+    service_rate_full = _compute_service_rate(episode_log)  # 与runner一致的完整口径
+    service_rate_simple = compute_service_rate_simple(episode_log)  # 仅终态请求
+    
+    # 原有逻辑保留（用于论文对比）：分母 = total - structural
     non_structural = max(0.0, total_requests - structural)
     waiting_total = waiting_churned + waiting_timeouts
     algorithmic = waiting_total + onboard_churned
-
-    service_rate = served / non_structural if non_structural > 0 else 0.0
+    
+    service_rate_legacy = served / non_structural if non_structural > 0 else 0.0
     waiting_churn_rate = waiting_total / non_structural if non_structural > 0 else 0.0
     onboard_churn_rate = onboard_churned / non_structural if non_structural > 0 else 0.0
     algorithmic_churn_rate = algorithmic / non_structural if non_structural > 0 else 0.0
@@ -82,19 +116,37 @@ def _compute_metrics(env: EventDrivenEnv, total_tacc: float) -> Dict[str, float]
 
     # Use aligned vector (all Layer-2 stops) for reproducible cross-baseline Gini
     gini = compute_service_volume_gini(env.service_count_by_stop, env.stop_ids)
+    
+    # H3: Conservation check
+    if not verify_request_conservation(episode_log):
+        import logging
+        LOG = logging.getLogger(__name__)
+        LOG.warning(
+            "⚠️ evaluator守恒校验失败: eligible=%.0f, structural=%.0f, total=%.0f",
+            eligible_total, structural, total_requests
+        )
 
     return {
+        # Raw counts
         "total_requests": total_requests,
         "served": served,
         "waiting_churned": waiting_churned,
         "waiting_timeouts": waiting_timeouts,
         "onboard_churned": onboard_churned,
+        "waiting_remaining": waiting_remaining,
+        "onboard_remaining": onboard_remaining,
         "structural_unserviceable": structural,
-        "service_rate": float(service_rate),
+        # Unified metrics (与runner一致)
+        "eligible_total": eligible_total,
+        "service_rate": float(service_rate_full),  # 主指标：统一口径
+        "service_rate_simple": float(service_rate_simple),  # 仅终态
+        "service_rate_legacy": float(service_rate_legacy),  # 原有口径（用于对比）
+        # Churn rates (保留原有)
         "waiting_churn_rate": float(waiting_churn_rate),
         "onboard_churn_rate": float(onboard_churn_rate),
         "algorithmic_churn_rate": float(algorithmic_churn_rate),
         "structural_unserviceable_rate": float(structural_rate),
+        # Other metrics
         "tacc_total": float(total_tacc),
         "wait_time_p95_sec": float(wait_p95),
         "service_gini": float(gini),
@@ -501,6 +553,10 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         reward_cvar_penalty=float(env_cfg.get("reward_cvar_penalty", 1.0)),
         reward_fairness_weight=float(env_cfg.get("reward_fairness_weight", 1.0)),
         reward_congestion_penalty=float(env_cfg.get("reward_congestion_penalty", 0.0)),
+        reward_scale=float(env_cfg.get("reward_scale", 1.0)),
+        reward_step_backlog_penalty=float(env_cfg.get("reward_step_backlog_penalty", 0.0)),
+        reward_waiting_time_penalty_per_sec=float(env_cfg.get("reward_waiting_time_penalty_per_sec", 0.0)),
+        demand_exhausted_min_time_sec=float(env_cfg.get("demand_exhausted_min_time_sec", 300.0)),
         cvar_alpha=float(env_cfg.get("cvar_alpha", 0.95)),
         fairness_gamma=float(env_cfg.get("fairness_gamma", 1.0)),
         travel_time_multiplier=float(env_cfg.get("travel_time_multiplier", 1.0)),

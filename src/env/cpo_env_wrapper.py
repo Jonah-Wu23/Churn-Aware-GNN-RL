@@ -277,9 +277,9 @@ class CPOEnvWrapper(gym.Env):
         n_valid = min(len(raw_mask), self.neighbor_k)
         action_mask[:n_valid] = raw_mask[:n_valid]
         
-        # NOOP is always valid
+        # NOOP is only valid when no feasible actions exist
         if self.include_noop:
-            action_mask[-1] = True
+            action_mask[-1] = not bool(np.any(action_mask[:n_valid]))
         
         # Action to stop mapping
         actions = features["actions"].astype(np.int64)

@@ -20,18 +20,23 @@ from src.models.edge_q_gnn import EdgeQGNN
 from src.train.dqn import DQNConfig, DQNTrainer, build_hashes
 from src.train.runner import run_curriculum_training
 from src.utils.config import load_config
+from src.utils.build_info import get_build_id
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--run-dir", default=None)
+    parser.add_argument("--start-stage", default=None)
+    parser.add_argument("--init-model-path", default=None)
     return parser.parse_args()
 
 
 def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
     return EnvConfig(
         max_horizon_steps=int(env_cfg.get("max_horizon_steps", 200)),
+        max_sim_time_sec=env_cfg.get("max_sim_time_sec"),
+        allow_stop_when_actions_exist=bool(env_cfg.get("allow_stop_when_actions_exist", False)),
         mask_alpha=float(env_cfg.get("mask_alpha", 1.5)),
         walk_threshold_sec=int(env_cfg.get("walk_threshold_sec", 600)),
         max_requests=int(env_cfg.get("max_requests", 2000)),
@@ -49,16 +54,32 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         onboard_churn_tol_sec=env_cfg.get("onboard_churn_tol_sec"),
         onboard_churn_beta=env_cfg.get("onboard_churn_beta"),
         reward_service=float(env_cfg.get("reward_service", 1.0)),
+        reward_service_transform=str(env_cfg.get("reward_service_transform", "none")),
+        reward_service_transform_scale=float(env_cfg.get("reward_service_transform_scale", 1.0)),
         reward_waiting_churn_penalty=float(env_cfg.get("reward_waiting_churn_penalty", 1.0)),
         reward_onboard_churn_penalty=float(env_cfg.get("reward_onboard_churn_penalty", 1.0)),
         reward_travel_cost_per_sec=float(env_cfg.get("reward_travel_cost_per_sec", 0.0)),
         reward_tacc_weight=float(env_cfg.get("reward_tacc_weight", 1.0)),
+        reward_tacc_transform=str(env_cfg.get("reward_tacc_transform", "none")),
+        reward_tacc_transform_scale=float(env_cfg.get("reward_tacc_transform_scale", 1.0)),
         reward_onboard_delay_weight=float(env_cfg.get("reward_onboard_delay_weight", 0.1)),
         reward_cvar_penalty=float(env_cfg.get("reward_cvar_penalty", 1.0)),
         reward_fairness_weight=float(env_cfg.get("reward_fairness_weight", 1.0)),
+        reward_scale=float(env_cfg.get("reward_scale", 1.0)),
+        reward_step_backlog_penalty=float(env_cfg.get("reward_step_backlog_penalty", 0.0)),
+        reward_waiting_time_penalty_per_sec=float(env_cfg.get("reward_waiting_time_penalty_per_sec", 0.0)),
+        reward_potential_alpha=float(env_cfg.get("reward_potential_alpha", 0.0)),
+        reward_potential_alpha_source=str(env_cfg.get("reward_potential_alpha_source", "env_default")),
+        reward_potential_lost_weight=float(env_cfg.get("reward_potential_lost_weight", 0.0)),
+        reward_potential_scale_with_reward_scale=bool(
+            env_cfg.get("reward_potential_scale_with_reward_scale", True)
+        ),
+        demand_exhausted_min_time_sec=float(env_cfg.get("demand_exhausted_min_time_sec", 300.0)),
         cvar_alpha=float(env_cfg.get("cvar_alpha", 0.95)),
         fairness_gamma=float(env_cfg.get("fairness_gamma", 1.0)),
         debug_mask=bool(env_cfg.get("debug_mask", False)),
+        debug_abort_on_alert=bool(env_cfg.get("debug_abort_on_alert", True)),
+        debug_dump_dir=str(env_cfg.get("debug_dump_dir", "reports/debug/potential_alerts")),
         od_glob=env_cfg.get("od_glob", "data/processed/od_mapped/*.parquet"),
         graph_nodes_path=env_cfg.get("graph_nodes_path", "data/processed/graph/layer2_nodes.parquet"),
         graph_edges_path=env_cfg.get("graph_edges_path", "data/processed/graph/layer2_edges.parquet"),
@@ -125,6 +146,7 @@ def _run_single_training(cfg: Dict[str, Any], run_dir: Path) -> Path:
     trainer = DQNTrainer(
         env=env, model=model, config=dqn_config, run_dir=run_dir,
         graph_hashes=graph_hashes, od_hashes=od_hashes, env_cfg=env_cfg,
+        viz_config=train_cfg.get("viz") if isinstance(train_cfg, dict) else None,
     )
     log_path = trainer.train()
     trainer.close()
@@ -134,6 +156,8 @@ def _run_single_training(cfg: Dict[str, Any], run_dir: Path) -> Path:
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO)
+    build_id = get_build_id()
+    logging.info("BUILD_ID=%s", build_id)
 
     cfg = load_config(args.config)
     if args.run_dir:
@@ -144,7 +168,12 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     if _use_curriculum(cfg):
-        log_path = run_curriculum_training(args.config, run_dir=run_dir)
+        log_path = run_curriculum_training(
+            args.config,
+            run_dir=run_dir,
+            start_stage=args.start_stage,
+            init_model_path=args.init_model_path,
+        )
         logging.info("Curriculum training finished: %s", log_path)
     else:
         log_path = _run_single_training(cfg, run_dir)

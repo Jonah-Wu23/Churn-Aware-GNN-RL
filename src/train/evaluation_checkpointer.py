@@ -75,6 +75,7 @@ class EvaluationCheckpointer:
         select_action_fn: Callable[[nn.Module, Dict[str, np.ndarray]], Optional[int]],
         compute_rho_fn: Callable[[Dict[str, float]], float],
         device: torch.device,
+        gamma: float = 1.0,  # H1: gamma must be passed in, not hardcoded
     ):
         """
         Args:
@@ -83,12 +84,14 @@ class EvaluationCheckpointer:
             select_action_fn: Function to select action given model and features
             compute_rho_fn: Function to compute rho from episode info
             device: Torch device for model inference
+            gamma: Gamma parameter for rho calculation (must match runner's gamma)
         """
         self.config = config
         self.env_factory = env_factory
         self.select_action_fn = select_action_fn
         self.compute_rho_fn = compute_rho_fn
         self.device = device
+        self.gamma = gamma  # Store gamma for consistency check
         
         self.best_rho: float = -1.0
         self.best_result: Optional[EvalResult] = None
@@ -97,7 +100,18 @@ class EvaluationCheckpointer:
         self.collapse_counter: int = 0
     
     def _run_greedy_episode(self, model: nn.Module, env) -> Dict[str, float]:
-        """Run a single episode with epsilon=0 (greedy)."""
+        """Run a single episode with epsilon=0 (greedy).
+        
+        Uses runner's public functions for consistent metric calculation.
+        """
+        # Import runner's public functions for unified metrics
+        from src.train.runner import (
+            compute_eligible,
+            compute_service_rate_simple,
+            _compute_service_rate,
+            verify_request_conservation,
+        )
+        
         model.eval()
         env.reset()
         total_reward = 0.0
@@ -114,24 +128,59 @@ class EvaluationCheckpointer:
                 _, reward, done, info = env.step(int(action))
                 total_reward += float(reward)
         
-        # Compute metrics
+        # Extract raw metrics from info
         served = float(info.get("served", 0))
         waiting_churned = float(info.get("waiting_churned", 0))
         onboard_churned = float(info.get("onboard_churned", 0))
         waiting_timeouts = float(info.get("waiting_timeouts", 0))
+        waiting_remaining = float(info.get("waiting_remaining", 0))
+        onboard_remaining = float(info.get("onboard_remaining", 0))
+        structural_unserviceable = float(info.get("structural_unserviceable", 0))
         stuckness = float(info.get("stuckness", 0))
+        total_requests = float(info.get("total_requests", 0))
         
-        eligible = served + waiting_churned + onboard_churned + waiting_timeouts
-        service_rate = served / eligible if eligible > 0 else 0.0
+        # Use unified functions for metric calculation
+        eligible_total = compute_eligible(info)
+        service_rate = _compute_service_rate(info)
+        service_rate_simple = compute_service_rate_simple(info)
+        rho = self.compute_rho_fn(info)
+        
+        # H1: Consistency check using stored gamma (not hardcoded)
+        service_rate_from_rho = rho * (1.0 + self.gamma * stuckness)
+        consistency_diff = abs(service_rate - service_rate_from_rho)
+        
+        if consistency_diff > 1e-4:
+            LOG.warning(
+                "⚠️ 口径不一致: service_rate=%.6f, service_rate_from_rho=%.6f, diff=%.6f, gamma=%.2f",
+                service_rate, service_rate_from_rho, consistency_diff, self.gamma
+            )
+        
+        # H3: Conservation check
+        if not verify_request_conservation(info):
+            LOG.warning(
+                "⚠️ 守恒校验失败: eligible=%.0f, structural=%.0f, total=%.0f",
+                eligible_total, structural_unserviceable, total_requests
+            )
         
         return {
+            # Raw metrics
             "served": served,
             "waiting_churned": waiting_churned,
             "onboard_churned": onboard_churned,
             "waiting_timeouts": waiting_timeouts,
+            "waiting_remaining": waiting_remaining,
+            "onboard_remaining": onboard_remaining,
+            "structural_unserviceable": structural_unserviceable,
+            "total_requests": total_requests,
+            # Unified metrics
+            "eligible_total": eligible_total,
             "service_rate": service_rate,
+            "service_rate_simple": service_rate_simple,
             "stuckness": stuckness,
-            "rho": self.compute_rho_fn(info),
+            "rho": rho,
+            # Consistency check
+            "service_rate_from_rho": service_rate_from_rho,
+            "consistency_diff": consistency_diff,
             "episode_return": total_reward,
         }
     

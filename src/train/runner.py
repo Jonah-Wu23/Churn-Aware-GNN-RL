@@ -43,6 +43,7 @@ class CurriculumConfig:
     gamma: float = 1.0
     stage_max_steps: int = 50000
     stage_min_episodes: int = 3
+    stage_steps: Dict[str, int] = field(default_factory=dict)
     
     # Rho-gated transition settings
     rho_window_size: int = 5
@@ -51,6 +52,9 @@ class CurriculumConfig:
     max_stage_extensions: int = 2
     fail_policy: str = "fail_fast"  # "fail_fast" or "forced"
     rho_warning_threshold: float = 0.35  # 70% of trigger_rho (0.5)
+    stage_require_rho: Dict[str, bool] = field(default_factory=dict)
+    rho_gate_source: str = "auto"  # "auto", "eval", "train", "max"
+    stage_rho_gate_source: Dict[str, str] = field(default_factory=dict)
     
     # Collapse protection
     collapse_drop_delta: float = 0.10
@@ -73,6 +77,8 @@ class CurriculumConfig:
 def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
     return EnvConfig(
         max_horizon_steps=int(env_cfg.get("max_horizon_steps", 200)),
+        max_sim_time_sec=env_cfg.get("max_sim_time_sec"),
+        allow_stop_when_actions_exist=bool(env_cfg.get("allow_stop_when_actions_exist", False)),
         mask_alpha=float(env_cfg.get("mask_alpha", 1.5)),
         walk_threshold_sec=int(env_cfg.get("walk_threshold_sec", 600)),
         max_requests=int(env_cfg.get("max_requests", 2000)),
@@ -90,17 +96,33 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         onboard_churn_tol_sec=env_cfg.get("onboard_churn_tol_sec"),
         onboard_churn_beta=env_cfg.get("onboard_churn_beta"),
         reward_service=float(env_cfg.get("reward_service", 1.0)),
+        reward_service_transform=str(env_cfg.get("reward_service_transform", "none")),
+        reward_service_transform_scale=float(env_cfg.get("reward_service_transform_scale", 1.0)),
         reward_waiting_churn_penalty=float(env_cfg.get("reward_waiting_churn_penalty", 1.0)),
         reward_onboard_churn_penalty=float(env_cfg.get("reward_onboard_churn_penalty", 1.0)),
         reward_travel_cost_per_sec=float(env_cfg.get("reward_travel_cost_per_sec", 0.0)),
         reward_tacc_weight=float(env_cfg.get("reward_tacc_weight", 1.0)),
+        reward_tacc_transform=str(env_cfg.get("reward_tacc_transform", "none")),
+        reward_tacc_transform_scale=float(env_cfg.get("reward_tacc_transform_scale", 1.0)),
         reward_onboard_delay_weight=float(env_cfg.get("reward_onboard_delay_weight", 0.1)),
         reward_cvar_penalty=float(env_cfg.get("reward_cvar_penalty", 1.0)),
         reward_fairness_weight=float(env_cfg.get("reward_fairness_weight", 1.0)),
         reward_congestion_penalty=float(env_cfg.get("reward_congestion_penalty", 0.0)),
+        reward_scale=float(env_cfg.get("reward_scale", 1.0)),
+        reward_step_backlog_penalty=float(env_cfg.get("reward_step_backlog_penalty", 0.0)),
+        reward_waiting_time_penalty_per_sec=float(env_cfg.get("reward_waiting_time_penalty_per_sec", 0.0)),
+        reward_potential_alpha=float(env_cfg.get("reward_potential_alpha", 0.0)),
+        reward_potential_alpha_source=str(env_cfg.get("reward_potential_alpha_source", "env_default")),
+        reward_potential_lost_weight=float(env_cfg.get("reward_potential_lost_weight", 0.0)),
+        reward_potential_scale_with_reward_scale=bool(
+            env_cfg.get("reward_potential_scale_with_reward_scale", True)
+        ),
+        demand_exhausted_min_time_sec=float(env_cfg.get("demand_exhausted_min_time_sec", 300.0)),
         cvar_alpha=float(env_cfg.get("cvar_alpha", 0.95)),
         fairness_gamma=float(env_cfg.get("fairness_gamma", 1.0)),
         debug_mask=bool(env_cfg.get("debug_mask", False)),
+        debug_abort_on_alert=bool(env_cfg.get("debug_abort_on_alert", True)),
+        debug_dump_dir=str(env_cfg.get("debug_dump_dir", "reports/debug/potential_alerts")),
         od_glob=env_cfg.get("od_glob", "data/processed/od_mapped/*.parquet"),
         graph_nodes_path=env_cfg.get("graph_nodes_path", "data/processed/graph/layer2_nodes.parquet"),
         graph_edges_path=env_cfg.get("graph_edges_path", "data/processed/graph/layer2_edges.parquet"),
@@ -172,10 +194,13 @@ def _stage_specs_from_config(
     return specs, env_overrides_map
 
 
-def _compute_service_rate(log: Dict[str, float]) -> float:
-    """Compute service rate with backlog in denominator.
+def compute_eligible(log: Dict[str, float]) -> float:
+    """计算完整 eligible 分母（所有进入系统的可服务请求）。
     
-    Denominator: all requests that entered the system (served + churned + timeouts + backlog).
+    eligible = served + waiting_churned + onboard_churned + waiting_timeouts + waiting_remaining + onboard_remaining
+    
+    注意：structural_unserviceable 不计入 eligible，因为它们在结构上不可服务。
+    守恒关系：eligible + structural_unserviceable == total_arrived_requests
     """
     served = float(log.get("served", 0.0))
     waiting_churned = float(log.get("waiting_churned", 0.0))
@@ -183,11 +208,60 @@ def _compute_service_rate(log: Dict[str, float]) -> float:
     waiting_timeouts = float(log.get("waiting_timeouts", 0.0))
     waiting_remaining = float(log.get("waiting_remaining", 0.0))
     onboard_remaining = float(log.get("onboard_remaining", 0.0))
+    return served + waiting_churned + onboard_churned + waiting_timeouts + waiting_remaining + onboard_remaining
+
+
+def compute_service_rate_simple(log: Dict[str, float]) -> float:
+    """计算简化 service_rate（仅已结束请求，用于论文对比）。
     
-    eligible = (served + waiting_churned + onboard_churned + 
-                waiting_timeouts + waiting_remaining + onboard_remaining)
+    分母：eligible_simple = served + waiting_churned + onboard_churned + waiting_timeouts
+    不含 waiting_remaining 和 onboard_remaining。
+    
+    用途：
+    - 与"只统计终态"的既有工作口径对比
+    - 论文中称为 "conditional-on-terminated service rate"
+    """
+    served = float(log.get("served", 0.0))
+    waiting_churned = float(log.get("waiting_churned", 0.0))
+    onboard_churned = float(log.get("onboard_churned", 0.0))
+    waiting_timeouts = float(log.get("waiting_timeouts", 0.0))
+    eligible_simple = served + waiting_churned + onboard_churned + waiting_timeouts
+    if eligible_simple <= 0:
+        return 0.0
+    return served / eligible_simple
+
+
+def verify_request_conservation(log: Dict[str, float], tolerance: float = 1e-6) -> bool:
+    """验证请求守恒：eligible_total + structural_unserviceable == total_requests。
+    
+    确保每个请求最终状态只落在一个终态集合里。
+    
+    Returns:
+        True 如果守恒成立，False 如果存在不一致
+    """
+    eligible = compute_eligible(log)
+    structural = float(log.get("structural_unserviceable", 0.0))
+    total_requests = float(log.get("total_requests", 0.0))
+    
+    # 如果 total_requests 未填充，尝试从 served + churned + remaining + structural 反推
+    if total_requests <= 0:
+        # 无法验证，默认通过
+        return True
+    
+    computed_total = eligible + structural
+    return abs(computed_total - total_requests) <= tolerance
+
+
+def _compute_service_rate(log: Dict[str, float]) -> float:
+    """Compute service rate with backlog in denominator.
+    
+    Denominator: all requests that entered the system (served + churned + timeouts + backlog).
+    Uses compute_eligible() for consistent calculation.
+    """
+    eligible = compute_eligible(log)
     if eligible <= 0:
         return 0.0
+    served = float(log.get("served", 0.0))
     return served / eligible
 
 
@@ -206,6 +280,35 @@ def _compute_rho_window_mean(rho_history: List[float], window_size: int) -> floa
     return float(np.mean(window))
 
 
+def _select_eval_action(
+    model: torch.nn.Module,
+    features: Dict[str, np.ndarray],
+    device: torch.device,
+) -> Optional[int]:
+    actions = features["actions"].astype(np.int64)
+    mask = features["action_mask"].astype(bool)
+    if len(actions) == 0 or not np.any(mask):
+        return None
+    obs_idx = int(features["current_node_index"][0]) if len(features["current_node_index"]) else 0
+    dst = torch.tensor(features["action_node_indices"].astype(np.int64), device=device)
+    src = torch.full_like(dst, int(obs_idx), dtype=torch.long)
+    action_edge_index = torch.stack([src, dst], dim=0)
+    data = {
+        "node_features": torch.tensor(features["node_features"], dtype=torch.float32, device=device),
+        "graph_edge_index": torch.tensor(features["graph_edge_index"], dtype=torch.long, device=device),
+        "graph_edge_features": torch.tensor(features["graph_edge_features"], dtype=torch.float32, device=device),
+        "action_edge_index": action_edge_index,
+        "edge_features": torch.tensor(features["edge_features"], dtype=torch.float32, device=device),
+    }
+    with torch.no_grad():
+        q = model(data).detach()
+    q_masked = q.clone()
+    invalid = torch.tensor(~mask, device=device)
+    q_masked[invalid] = -1e9
+    idx = int(torch.argmax(q_masked).item())
+    return int(actions[idx])
+
+
 def _merge_env_cfg(
     base_cfg: Dict[str, Any],
     stage_overrides: Dict[str, float | int],
@@ -215,6 +318,12 @@ def _merge_env_cfg(
     merged.update(stage_overrides)
     if phase_overrides:
         merged.update(phase_overrides)
+    source = "env_default"
+    if "reward_potential_alpha" in stage_overrides:
+        source = "stage_override"
+    if phase_overrides and "reward_potential_alpha" in phase_overrides:
+        source = "phase_override"
+    merged["reward_potential_alpha_source"] = source
     return merged
 
 
@@ -416,6 +525,7 @@ def run_curriculum_training(
     curriculum_cfg = cfg.get("curriculum", {})
     train_cfg = cfg.get("train", {})
     model_cfg = cfg.get("model", {})
+    viz_cfg = train_cfg.get("viz") if isinstance(train_cfg, dict) else None
 
     curriculum = CurriculumConfig(
         stages=list(curriculum_cfg.get("stages", ["L0", "L1", "L2", "L3"])),
@@ -430,6 +540,9 @@ def run_curriculum_training(
         max_stage_extensions=int(curriculum_cfg.get("max_stage_extensions", 2)),
         fail_policy=str(curriculum_cfg.get("fail_policy", "fail_fast")),
         rho_warning_threshold=float(curriculum_cfg.get("rho_warning_threshold", 0.35)),
+        stage_require_rho=dict(curriculum_cfg.get("stage_require_rho", {})),
+        rho_gate_source=str(curriculum_cfg.get("rho_gate_source", "auto")),
+        stage_rho_gate_source=dict(curriculum_cfg.get("stage_rho_gate_source", {})),
         # Collapse protection
         collapse_drop_delta=float(curriculum_cfg.get("collapse_drop_delta", 0.10)),
         collapse_min_rho=float(curriculum_cfg.get("collapse_min_rho", 0.15)),
@@ -444,6 +557,7 @@ def run_curriculum_training(
         # Reward ramp settings
         reward_ramp_steps=int(curriculum_cfg.get("reward_ramp_steps", 10000)),
         ramp_fields=list(curriculum_cfg.get("ramp_fields", DEFAULT_RAMP_FIELDS)),
+        stage_steps=dict(curriculum_cfg.get("stage_steps", {})),
     )
     # Read strict_stage_params and parse stages
     strict = bool(curriculum_cfg.get("strict_stage_params", False))
@@ -558,12 +672,57 @@ def run_curriculum_training(
     bc_congestion_weight = float(bc_cfg.get("teacher_congestion_weight", 0.5))
     bc_coverage_weight = float(bc_cfg.get("teacher_coverage_weight", 0.3))
     epsilon_by_stage_cfg = curriculum_cfg.get("epsilon_by_stage", {})
+    eval_config = EvalConfig(
+        eval_seeds=list(curriculum.eval_seeds),
+        eval_interval_steps=int(curriculum.eval_interval_steps),
+        eval_epsilon=float(curriculum_cfg.get("eval_epsilon", 0.0)),
+        eval_episodes_per_seed=int(curriculum_cfg.get("eval_episodes_per_seed", 1)),
+        collapse_drop_delta=float(curriculum.collapse_drop_delta),
+        collapse_min_rho=float(curriculum.collapse_min_rho),
+        collapse_patience=int(curriculum.collapse_patience),
+    )
+
+    def _build_eval_checkpointer(env_cfg: Dict[str, Any]) -> Optional[EvaluationCheckpointer]:
+        if not curriculum.eval_enabled:
+            return None
+        device = torch.device(dqn_config.device)
+
+        def _env_factory() -> EventDrivenEnv:
+            return EventDrivenEnv(_build_env_config(env_cfg))
+
+        def _select_action(model: torch.nn.Module, features: Dict[str, np.ndarray]) -> Optional[int]:
+            return _select_eval_action(model, features, device)
+
+        def _rho_fn(info: Dict[str, float]) -> float:
+            return _compute_rho(info, curriculum.gamma)
+
+        return EvaluationCheckpointer(
+            config=eval_config,
+            env_factory=_env_factory,
+            select_action_fn=_select_action,
+            compute_rho_fn=_rho_fn,
+            device=device,
+            gamma=curriculum.gamma,  # H1: Pass gamma from curriculum config
+        )
 
     for local_idx, spec in enumerate(run_specs):
         current_stage_idx = start_index + local_idx
+        stage_budget = int(curriculum.stage_steps.get(spec.name, curriculum.stage_max_steps))
         stage_dir = run_dir / f"stage_{spec.name}"
         stage_dir.mkdir(parents=True, exist_ok=True)
         best_model_path = stage_dir / "edgeq_model_best.pt"
+        
+        phase1_steps_default = int(stage_budget * 0.4)
+        phase1_steps_cfg = int(l3_two_stage_cfg.get("phase1_steps", phase1_steps_default))
+        phase2_steps_cfg = l3_two_stage_cfg.get("phase2_steps")
+        phase1_steps = max(0, min(int(stage_budget), phase1_steps_cfg))
+        remaining_steps = int(stage_budget) - phase1_steps
+        if phase2_steps_cfg is None:
+            phase2_steps = remaining_steps
+            phase3_steps = 0
+        else:
+            phase2_steps = max(0, min(int(remaining_steps), int(phase2_steps_cfg)))
+            phase3_steps = max(0, int(stage_budget) - phase1_steps - phase2_steps)
         stage_output = generate_stage(
             base_od=base_od,
             nodes=nodes,
@@ -577,12 +736,77 @@ def run_curriculum_training(
         episode_count = 0
         latest_rho = 0.0
         rho_history: List[float] = []  # Track rho for window mean
+        eval_rho_history: List[float] = []
         best_service_rate = -1.0
         best_state_dict: Optional[Dict[str, torch.Tensor]] = None
         trainer: Optional[DQNTrainer] = None
+        eval_checkpointer: Optional[EvaluationCheckpointer] = None
         current_phase: str = "main"  # Track current phase for logging
         phase_step: int = 0  # Track steps within phase for ramp
         current_env_cfg: Dict[str, Any] = {}  # Track current env config
+
+        def _reset_eval_for_env(env_cfg_for_eval: Dict[str, Any]) -> None:
+            nonlocal eval_checkpointer, eval_rho_history
+            eval_rho_history = []
+            eval_checkpointer = _build_eval_checkpointer(env_cfg_for_eval)
+
+        def _run_eval_if_needed() -> None:
+            if eval_checkpointer is None or trainer is None:
+                return
+            if not eval_checkpointer.should_evaluate(trainer.global_step):
+                return
+            eval_result = eval_checkpointer.evaluate(
+                model=trainer.model,
+                global_step=int(trainer.global_step),
+                stage=spec.name,
+                phase=current_phase,
+                alpha=float(current_env_cfg.get("reward_potential_alpha", 0.0)) if current_env_cfg else 0.0,
+                env_cfg_hash=compute_env_cfg_hash(current_env_cfg) if current_env_cfg else "",
+                replay_size=int(trainer.buffer.size),
+                save_dir=stage_dir,
+                log_handle=log_handle,
+            )
+            eval_rho_history.append(float(eval_result.mean_rho))
+
+        def _ensure_eval_sample() -> None:
+            if not curriculum.eval_enabled:
+                return
+            if eval_checkpointer is None or trainer is None:
+                return
+            if eval_rho_history:
+                return
+            eval_result = eval_checkpointer.evaluate(
+                model=trainer.model,
+                global_step=int(trainer.global_step),
+                stage=spec.name,
+                phase=current_phase,
+                alpha=float(current_env_cfg.get("reward_potential_alpha", 0.0)) if current_env_cfg else 0.0,
+                env_cfg_hash=compute_env_cfg_hash(current_env_cfg) if current_env_cfg else "",
+                replay_size=int(trainer.buffer.size),
+                save_dir=stage_dir,
+                log_handle=log_handle,
+            )
+            eval_rho_history.append(float(eval_result.mean_rho))
+
+        def _get_gate_rho(stage_name: str) -> Tuple[float, str]:
+            source = curriculum.stage_rho_gate_source.get(stage_name, curriculum.rho_gate_source)
+            source = str(source).lower()
+            train_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+            eval_mean = _compute_rho_window_mean(eval_rho_history, curriculum.rho_window_size)
+
+            if source == "train":
+                return train_mean, "train"
+            if source == "eval":
+                if curriculum.eval_enabled and eval_rho_history:
+                    return eval_mean, "eval"
+                return train_mean, "train"
+            if source == "max":
+                if curriculum.eval_enabled and eval_rho_history:
+                    return max(train_mean, eval_mean), "max"
+                return train_mean, "train"
+            if curriculum.eval_enabled and eval_rho_history:
+                return eval_mean, "eval"
+            return train_mean, "train"
 
         def _on_episode_end(ep_log: Dict[str, float]) -> bool:
             nonlocal episode_count, latest_rho, rho_history, best_service_rate, best_state_dict, trainer, current_phase
@@ -619,6 +843,9 @@ def run_curriculum_training(
                     record[metric_key] = float(ep_log.get(metric_key, 0.0))
             log_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             log_handle.flush()
+
+            if curriculum.eval_enabled:
+                _run_eval_if_needed()
             
             # Update best model based on service_rate (legacy behavior)
             if trainer is not None and service_rate > best_service_rate:
@@ -636,11 +863,15 @@ def run_curriculum_training(
                 return False
             return rho_window_mean >= curriculum.trigger_rho
 
-        def _apply_stage_epsilon_schedule(trainer: DQNTrainer, stage_name: str) -> None:
+        def _apply_stage_epsilon_schedule(
+            trainer: DQNTrainer,
+            stage_name: str,
+            stage_budget: int,
+        ) -> None:
             schedule = _resolve_stage_epsilon_schedule(
                 stage_name=stage_name,
                 schedule_cfg=epsilon_by_stage_cfg,
-                default_decay_steps=int(curriculum.stage_max_steps),
+                default_decay_steps=int(stage_budget),
             )
             if schedule is None:
                 return
@@ -686,8 +917,10 @@ def run_curriculum_training(
                 od_hashes=od_hashes,
                 global_step_init=model._global_step if hasattr(model, '_global_step') else 0,
                 env_cfg=phase1_env_cfg,
+                viz_config=viz_cfg,
             )
-            _apply_stage_epsilon_schedule(trainer, spec.name)
+            _reset_eval_for_env(phase1_env_cfg)
+            _apply_stage_epsilon_schedule(trainer, spec.name, stage_budget)
             
             # Log phase1 transition
             log_handle.write(json.dumps({
@@ -738,6 +971,7 @@ def run_curriculum_training(
                 new_env = EventDrivenEnv(_build_env_config(phase2_env_cfg))
                 replay_size_before = trainer.buffer.size
                 trainer._attach_env(new_env, phase2_env_cfg)
+                _reset_eval_for_env(phase2_env_cfg)
                 
                 # Log phase2 transition
                 log_handle.write(json.dumps({
@@ -774,6 +1008,7 @@ def run_curriculum_training(
                 new_env = EventDrivenEnv(_build_env_config(phase3_env_cfg))
                 replay_size_before = trainer.buffer.size
                 trainer._attach_env(new_env, phase3_env_cfg)
+                _reset_eval_for_env(phase3_env_cfg)
 
                 ramp_config = _build_ramp_config_from_envs(
                     phase2_env_cfg=phase2_env_cfg,
@@ -821,21 +1056,36 @@ def run_curriculum_training(
             extension_count = 0
             stage_passed = False
             forced_transition = False
+            require_rho_transition = bool(
+                curriculum.stage_require_rho.get(spec.name, curriculum.require_rho_transition)
+            )
             
             while not stage_passed:
-                # Check if rho threshold met
-                rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+                _ensure_eval_sample()
+                rho_window_mean, rho_source = _get_gate_rho(spec.name)
                 
-                if len(rho_history) >= curriculum.stage_min_episodes and rho_window_mean >= curriculum.trigger_rho:
-                    LOG.info("Stage L3 PASSED: rho_window_mean=%.4f >= trigger=%.4f", 
-                             rho_window_mean, curriculum.trigger_rho)
+                if (
+                    (len(eval_rho_history) if rho_source == "eval" else len(rho_history))
+                    >= curriculum.stage_min_episodes
+                    and rho_window_mean >= curriculum.trigger_rho
+                ):
+                    LOG.info(
+                        "Stage L3 PASSED: rho_window_mean=%.4f >= trigger=%.4f (source=%s)",
+                        rho_window_mean,
+                        curriculum.trigger_rho,
+                        rho_source,
+                    )
                     stage_passed = True
                     break
                 
                 # Not passed - check if we should extend or fail
-                if not curriculum.require_rho_transition:
-                    LOG.warning("Stage L3 FORCED transition: rho_window_mean=%.4f < trigger=%.4f",
-                               rho_window_mean, curriculum.trigger_rho)
+                if not require_rho_transition:
+                    LOG.warning(
+                        "Stage L3 FORCED transition: rho_window_mean=%.4f < trigger=%.4f (source=%s)",
+                        rho_window_mean,
+                        curriculum.trigger_rho,
+                        rho_source,
+                    )
                     forced_transition = True
                     stage_passed = True
                     break
@@ -843,13 +1093,19 @@ def run_curriculum_training(
                 extension_count += 1
                 if extension_count > curriculum.max_stage_extensions:
                     if curriculum.fail_policy == "fail_fast":
-                        LOG.error("Stage L3 FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions",
-                                  rho_window_mean, curriculum.trigger_rho, extension_count - 1)
+                        LOG.error(
+                            "Stage L3 FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions (source=%s)",
+                            rho_window_mean,
+                            curriculum.trigger_rho,
+                            extension_count - 1,
+                            rho_source,
+                        )
                         log_handle.write(json.dumps({
                             "type": "stage_failed",
                             "stage": "L3",
                             "rho_window_mean": float(rho_window_mean),
                             "trigger_rho": float(curriculum.trigger_rho),
+                            "rho_source": rho_source,
                             "extensions": extension_count - 1,
                         }, ensure_ascii=False) + "\n")
                         log_handle.flush()
@@ -861,13 +1117,20 @@ def run_curriculum_training(
                         break
                 
                 # Log and run extension
-                LOG.warning("Stage L3 extension %d/%d: rho_window_mean=%.4f < trigger=%.4f",
-                           extension_count, curriculum.max_stage_extensions, rho_window_mean, curriculum.trigger_rho)
+                LOG.warning(
+                    "Stage L3 extension %d/%d: rho_window_mean=%.4f < trigger=%.4f (source=%s)",
+                    extension_count,
+                    curriculum.max_stage_extensions,
+                    rho_window_mean,
+                    curriculum.trigger_rho,
+                    rho_source,
+                )
                 log_handle.write(json.dumps({
                     "type": "stage_extension",
                     "stage": "L3",
                     "extension": extension_count,
                     "rho_window_mean": float(rho_window_mean),
+                    "rho_source": rho_source,
                     "additional_steps": curriculum.stage_extension_steps,
                 }, ensure_ascii=False) + "\n")
                 log_handle.flush()
@@ -895,32 +1158,51 @@ def run_curriculum_training(
                 od_hashes=od_hashes,
                 global_step_init=model._global_step if hasattr(model, '_global_step') else 0,
                 env_cfg=stage_env_cfg,
+                viz_config=viz_cfg,
             )
-            _apply_stage_epsilon_schedule(trainer, spec.name)
+            _reset_eval_for_env(stage_env_cfg)
+            _apply_stage_epsilon_schedule(trainer, spec.name, stage_budget)
             
             # Extension loop for rho-gated transitions
             extension_count = 0
-            current_budget = int(curriculum.stage_max_steps)
+            current_budget = int(stage_budget)
             stage_passed = False
             forced_transition = False
+            require_rho_transition = bool(
+                curriculum.stage_require_rho.get(spec.name, curriculum.require_rho_transition)
+            )
             
             while not stage_passed:
                 # Train for current budget
                 trainer.train(total_steps=current_budget, episode_callback=_on_episode_end)
                 
-                # Check if rho threshold met
-                rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+                _ensure_eval_sample()
+                rho_window_mean, rho_source = _get_gate_rho(spec.name)
                 
-                if len(rho_history) >= curriculum.stage_min_episodes and rho_window_mean >= curriculum.trigger_rho:
-                    LOG.info("Stage %s PASSED: rho_window_mean=%.4f >= trigger=%.4f", 
-                             spec.name, rho_window_mean, curriculum.trigger_rho)
+                if (
+                    (len(eval_rho_history) if rho_source == "eval" else len(rho_history))
+                    >= curriculum.stage_min_episodes
+                    and rho_window_mean >= curriculum.trigger_rho
+                ):
+                    LOG.info(
+                        "Stage %s PASSED: rho_window_mean=%.4f >= trigger=%.4f (source=%s)",
+                        spec.name,
+                        rho_window_mean,
+                        curriculum.trigger_rho,
+                        rho_source,
+                    )
                     stage_passed = True
                     break
                 
                 # Not passed - check if we should extend or fail
-                if not curriculum.require_rho_transition:
-                    LOG.warning("Stage %s FORCED transition: rho_window_mean=%.4f < trigger=%.4f (require_rho_transition=False)",
-                               spec.name, rho_window_mean, curriculum.trigger_rho)
+                if not require_rho_transition:
+                    LOG.warning(
+                        "Stage %s FORCED transition: rho_window_mean=%.4f < trigger=%.4f (source=%s, require_rho_transition=False)",
+                        spec.name,
+                        rho_window_mean,
+                        curriculum.trigger_rho,
+                        rho_source,
+                    )
                     forced_transition = True
                     stage_passed = True
                     break
@@ -928,14 +1210,21 @@ def run_curriculum_training(
                 extension_count += 1
                 if extension_count > curriculum.max_stage_extensions:
                     if curriculum.fail_policy == "fail_fast":
-                        LOG.error("Stage %s FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions",
-                                  spec.name, rho_window_mean, curriculum.trigger_rho, extension_count - 1)
+                        LOG.error(
+                            "Stage %s FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions (source=%s)",
+                            spec.name,
+                            rho_window_mean,
+                            curriculum.trigger_rho,
+                            extension_count - 1,
+                            rho_source,
+                        )
                         # Log failure event
                         log_handle.write(json.dumps({
                             "type": "stage_failed",
                             "stage": spec.name,
                             "rho_window_mean": float(rho_window_mean),
                             "trigger_rho": float(curriculum.trigger_rho),
+                            "rho_source": rho_source,
                             "extensions": extension_count - 1,
                             "fail_policy": curriculum.fail_policy,
                         }, ensure_ascii=False) + "\n")
@@ -950,9 +1239,16 @@ def run_curriculum_training(
                         break
                 
                 # Log extension
-                LOG.warning("Stage %s extension %d/%d: rho_window_mean=%.4f < trigger=%.4f, adding %d steps",
-                           spec.name, extension_count, curriculum.max_stage_extensions, 
-                           rho_window_mean, curriculum.trigger_rho, curriculum.stage_extension_steps)
+                LOG.warning(
+                    "Stage %s extension %d/%d: rho_window_mean=%.4f < trigger=%.4f (source=%s), adding %d steps",
+                    spec.name,
+                    extension_count,
+                    curriculum.max_stage_extensions,
+                    rho_window_mean,
+                    curriculum.trigger_rho,
+                    rho_source,
+                    curriculum.stage_extension_steps,
+                )
                 log_handle.write(json.dumps({
                     "type": "stage_extension",
                     "stage": spec.name,
@@ -960,6 +1256,7 @@ def run_curriculum_training(
                     "max_extensions": curriculum.max_stage_extensions,
                     "rho_window_mean": float(rho_window_mean),
                     "trigger_rho": float(curriculum.trigger_rho),
+                    "rho_source": rho_source,
                     "additional_steps": curriculum.stage_extension_steps,
                 }, ensure_ascii=False) + "\n")
                 log_handle.flush()
@@ -978,7 +1275,8 @@ def run_curriculum_training(
             extra={"stage": spec.name, "stage_dir": str(stage_dir)},
         )
         # Compute final rho_window_mean for transition log
-        final_rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+        _ensure_eval_sample()
+        final_rho_window_mean, final_rho_source = _get_gate_rho(spec.name)
         transition = {
             "type": "stage_transition",
             "from_stage": spec.name,
@@ -988,6 +1286,7 @@ def run_curriculum_training(
             "last_rho": float(latest_rho),
             "rho_window_mean": float(final_rho_window_mean),
             "trigger_rho": float(curriculum.trigger_rho),
+            "rho_source": final_rho_source,
             "passed": final_rho_window_mean >= curriculum.trigger_rho,
             "forced_transition": 'forced_transition' in dir() and forced_transition,
         }

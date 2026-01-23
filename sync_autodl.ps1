@@ -94,6 +94,12 @@ Write-Host "`nSync complete!" -ForegroundColor Green
 Write-Host "New files: $($newFiles.Count)" -ForegroundColor Cyan
 Write-Host "Updated files: $($updatedFiles.Count)" -ForegroundColor Yellow
 
+# Write BUILD_ID.txt into upload bundle
+$buildId = & python -c "from src.utils.build_info import get_build_id; print(get_build_id())"
+$buildIdPath = Join-Path $uploadDir "BUILD_ID.txt"
+Set-Content -Path $buildIdPath -Value $buildId -Encoding ascii
+Write-Host "BUILD_ID: $buildId" -ForegroundColor Gray
+
 $zipPath = Join-Path $projectRoot "autodl_upload.zip"
 if (Test-Path $zipPath) {
     Remove-Item $zipPath -Force

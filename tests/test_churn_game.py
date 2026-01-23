@@ -108,7 +108,7 @@ def test_waiting_churn_reproducible(tmp_path: Path):
     env.waiting[0].append(
         {"request_id": 2, "request_time_sec": 100.0, "pickup_stop_id": 0, "status": "waiting"}
     )
-    churned, timeout, _, _, _, _, churned_ids, _ = env._apply_churn()
+    churned, timeout, _, _, _, _, churned_ids, _, _ = env._apply_churn()
 
     env2 = EventDrivenEnv(
         EnvConfig(
@@ -128,7 +128,7 @@ def test_waiting_churn_reproducible(tmp_path: Path):
     env2.waiting[0].append(
         {"request_id": 2, "request_time_sec": 100.0, "pickup_stop_id": 0, "status": "waiting"}
     )
-    churned2, timeout2, _, _, _, _, churned_ids2, _ = env2._apply_churn()
+    churned2, timeout2, _, _, _, _, churned_ids2, _, _ = env2._apply_churn()
 
     assert churned == churned2
     assert timeout == timeout2
@@ -160,7 +160,7 @@ def test_onboard_churn_reproducible(tmp_path: Path):
             "status": "onboard",
         }
     ]
-    churned, _, _, churned_ids = env._apply_onboard_churn(vehicle)
+    churned, _, _, churned_ids, _ = env._apply_onboard_churn(vehicle)
 
     env2 = EventDrivenEnv(
         EnvConfig(
@@ -183,7 +183,7 @@ def test_onboard_churn_reproducible(tmp_path: Path):
             "status": "onboard",
         }
     ]
-    churned2, _, _, churned_ids2 = env2._apply_onboard_churn(vehicle2)
+    churned2, _, _, churned_ids2, _ = env2._apply_onboard_churn(vehicle2)
 
     assert churned == churned2
     assert churned_ids == churned_ids2

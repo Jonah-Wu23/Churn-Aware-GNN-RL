@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import deque
 import json
 import logging
 from pathlib import Path
@@ -17,6 +18,9 @@ from torch.nn import functional as F
 
 from src.train.replay_buffer import BufferSpec, ReplayBuffer, PrioritizedReplayBuffer
 from src.utils.hashing import sha256_file
+from src.utils.build_info import get_build_id
+from src.utils.realtime_viz import RealtimeVizConfig, RealtimeVizPublisher
+from src.utils.reward_hack_alerts import RewardHackAlertConfig, RewardHackDetector
 
 LOG = logging.getLogger(__name__)
 
@@ -97,6 +101,7 @@ class DQNTrainer:
         od_hashes: Dict[str, str],
         global_step_init: int = 0,
         env_cfg: Optional[Dict[str, object]] = None,
+        viz_config: Optional[Dict[str, object]] = None,
     ) -> None:
         self.env = env
         self.model = model
@@ -128,11 +133,13 @@ class DQNTrainer:
         self.epsilon_cap: Optional[float] = None
         self.epsilon_cap_remaining: int = 0
 
+        max_degree = int(max(len(v) for v in env.neighbors.values())) if env.neighbors else 0
+        max_actions = max_degree + 1 if max_degree > 0 else 0
         spec = BufferSpec(
             num_nodes=int(len(env.stop_ids)),
             node_dim=int(model.node_dim),
             edge_dim=int(model.edge_dim),
-            max_actions=int(max(len(v) for v in env.neighbors.values())) if env.neighbors else 0,
+            max_actions=max_actions,
         )
         if config.prioritized_replay:
             self.buffer = PrioritizedReplayBuffer(
@@ -174,9 +181,21 @@ class DQNTrainer:
         self._log_handle.flush()
         self._reward_log_handle.flush()
 
+        self._viz_cfg = RealtimeVizConfig.from_dict(viz_config)
+        self._viz = RealtimeVizPublisher(self._viz_cfg)
+        alert_overrides = viz_config.get("alerts") if isinstance(viz_config, dict) else None
+        if isinstance(env_cfg, dict):
+            alert_overrides = dict(alert_overrides or {})
+            alert_overrides.setdefault("debug_abort_on_alert", env_cfg.get("debug_abort_on_alert", True))
+            alert_overrides.setdefault("debug_dump_dir", env_cfg.get("debug_dump_dir", "reports/debug/potential_alerts"))
+        alert_cfg = RewardHackAlertConfig.from_dict(alert_overrides)
+        self._alert_detector = RewardHackDetector(alert_cfg)
+        self._viz_window = deque(maxlen=200)
+        self._build_id = get_build_id()
+
     def _fallback_episode_info(self) -> Dict[str, float]:
         env = self.env
-        return {
+        info = {
             "served": float(getattr(env, "served", 0.0)),
             "waiting_churned": float(getattr(env, "waiting_churned", 0.0)),
             "waiting_timeouts": float(getattr(env, "waiting_timeouts", 0.0)),
@@ -185,6 +204,10 @@ class DQNTrainer:
             "waiting_remaining": float(sum(len(q) for q in getattr(env, "waiting", {}).values())),
             "onboard_remaining": float(sum(len(v.onboard) for v in getattr(env, "vehicles", []))),
         }
+        potential = getattr(env, "get_potential_debug", None)
+        if callable(potential):
+            info.update(potential())
+        return info
 
     def _compute_terminal_backlog_penalty(self) -> Tuple[float, float, float, float]:
         """计算终止积压惩罚（无有效动作时调用）。
@@ -221,6 +244,8 @@ class DQNTrainer:
             self._log_handle.close()
         if getattr(self, "_reward_log_handle", None):
             self._reward_log_handle.close()
+        if getattr(self, "_viz", None):
+            self._viz.close()
 
     def set_epsilon_schedule(
         self,
@@ -423,6 +448,279 @@ class DQNTrainer:
             q_masked[invalid] = -1e9
             idx = int(torch.argmax(q_masked).item())
             return int(actions[idx])
+
+    def _compute_entropy_stats(
+        self,
+        features: Dict[str, np.ndarray],
+        epsilon: float,
+    ) -> Dict[str, float]:
+        actions = features["actions"].astype(np.int64)
+        mask = features["action_mask"].astype(bool)
+        if len(actions) == 0 or not np.any(mask):
+            return {}
+        with torch.no_grad():
+            q = self._q_values(
+                obs=features["node_features"],
+                obs_idx=int(features["current_node_index"][0]),
+                action_nodes=features["action_node_indices"].astype(np.int64),
+                action_edge=features["edge_features"],
+            ).detach()
+        q_masked = q.clone()
+        invalid = torch.tensor(~mask, device=q.device)
+        q_masked[invalid] = -1e9
+        probs = torch.softmax(q_masked, dim=0)
+        probs_valid = probs[torch.tensor(mask, device=q.device)]
+        q_entropy = float(
+            (-probs_valid * torch.log(probs_valid + 1e-10)).sum().item()
+        )
+        q_mean = float(q_masked[~invalid].mean().item())
+        q_std = float(q_masked[~invalid].std(unbiased=False).item())
+        q_max = float(q_masked[~invalid].max().item())
+
+        valid_indices = np.where(mask)[0]
+        n_valid = int(len(valid_indices))
+        if n_valid <= 0:
+            eps_entropy = 0.0
+        else:
+            greedy_idx = int(torch.argmax(q_masked).item())
+            probs_eps = np.full(n_valid, float(epsilon) / float(n_valid), dtype=np.float32)
+            greedy_pos = int(np.where(valid_indices == greedy_idx)[0][0])
+            probs_eps[greedy_pos] += float(1.0 - epsilon)
+            eps_entropy = float(-(probs_eps * np.log(probs_eps + 1e-10)).sum())
+
+        if n_valid > 1:
+            q_entropy_norm = float(q_entropy / float(np.log(float(n_valid))))
+            eps_entropy_norm = float(eps_entropy / float(np.log(float(n_valid))))
+        else:
+            q_entropy_norm = 0.0
+            eps_entropy_norm = 0.0
+        return {
+            "q_entropy": q_entropy,
+            "epsilon_entropy": eps_entropy,
+            "q_entropy_norm": q_entropy_norm,
+            "epsilon_entropy_norm": eps_entropy_norm,
+            "q_mean": q_mean,
+            "q_std": q_std,
+            "q_max": q_max,
+        }
+
+    def _publish_viz(
+        self,
+        step: int,
+        episode_index: int,
+        episode_steps: int,
+        epsilon: float,
+        features: Dict[str, np.ndarray],
+        action: Optional[int],
+        reward: float,
+        done: bool,
+        info: Dict[str, float],
+    ) -> None:
+        if not self._viz.enabled:
+            return
+        if self._viz_cfg.publish_every_steps > 0 and step % int(self._viz_cfg.publish_every_steps) != 0:
+            if not (done and self._viz_cfg.publish_on_episode_end):
+                return
+        current_stop = int(features["current_stop"][0]) if len(features.get("current_stop", [])) else -1
+        action_idx = None
+        actions = features.get("actions", np.array([], dtype=np.int64)).astype(np.int64)
+        mask = features.get("action_mask", np.array([], dtype=bool)).astype(bool)
+        if action is not None and len(actions) > 0:
+            matches = np.where(actions == int(action))[0]
+            if len(matches) > 0:
+                action_idx = int(matches[0])
+        entropy_stats = self._compute_entropy_stats(features, epsilon) if len(actions) > 0 else {}
+        action_valid_ratio = float(mask.mean()) if len(mask) > 0 else 0.0
+        if action is None:
+            served_delta = 0.0
+            waiting_churn_delta = 0.0
+            stop_flag = 1.0
+            decision_flag = 0.0
+        else:
+            served_delta = float(info.get("step_served", 0.0))
+            waiting_churn_delta = float(info.get("step_waiting_churned", 0.0))
+            stop_flag = 0.0
+            decision_flag = 1.0
+        reward_total = float(info.get("reward_total", reward))
+        reward_nonzero = 1.0 if abs(reward_total) > 1e-6 else 0.0
+        invalid_flag = float(info.get("invalid_action", 0.0)) if info else 0.0
+        self._viz_window.append(
+            {
+                "decision": decision_flag,
+                "stop": stop_flag,
+                "served": served_delta,
+                "waiting_churned": waiting_churn_delta,
+                "invalid_action": invalid_flag,
+                "reward_nonzero": reward_nonzero,
+            }
+        )
+        window_len = len(self._viz_window)
+        decision_steps = sum(entry["decision"] for entry in self._viz_window)
+        stop_count = sum(entry["stop"] for entry in self._viz_window)
+        served_sum = sum(entry["served"] for entry in self._viz_window)
+        waiting_churn_sum = sum(entry["waiting_churned"] for entry in self._viz_window)
+        invalid_count = sum(entry["invalid_action"] for entry in self._viz_window)
+        reward_nonzero_count = sum(entry["reward_nonzero"] for entry in self._viz_window)
+        stop_ratio = float(stop_count / window_len) if window_len > 0 else 0.0
+        served_per_decision = float(served_sum / max(1.0, decision_steps))
+        waiting_churn_per_decision = float(waiting_churn_sum / max(1.0, decision_steps))
+        invalid_action_ratio = float(invalid_count / window_len) if window_len > 0 else 0.0
+        reward_nonzero_ratio = float(reward_nonzero_count / window_len) if window_len > 0 else 0.0
+        vehicles = []
+        for vehicle in getattr(self.env, "vehicles", []):
+            vehicles.append(
+                {
+                    "vehicle_id": int(vehicle.vehicle_id),
+                    "current_stop": int(vehicle.current_stop),
+                    "available_time": float(vehicle.available_time),
+                    "onboard": int(len(vehicle.onboard)),
+                }
+            )
+        reward_total = float(info.get("reward_total", reward))
+        reward_components = info.get("reward_components")
+        if isinstance(reward_components, dict) and reward_components:
+            reward_terms = dict(reward_components)
+        else:
+            reward_terms = {
+                "reward_base_service": float(info.get("reward_base_service", 0.0)),
+                "reward_waiting_churn_penalty": float(info.get("reward_waiting_churn_penalty", 0.0)),
+                "reward_fairness_penalty": float(info.get("reward_fairness_penalty", 0.0)),
+                "reward_cvar_penalty": float(info.get("reward_cvar_penalty", 0.0)),
+                "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
+                "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
+                "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
+                "reward_backlog_penalty": float(info.get("reward_backlog_penalty", 0.0)),
+                "reward_waiting_time_penalty": float(info.get("reward_waiting_time_penalty", 0.0)),
+                "reward_potential_shaping": float(info.get("reward_potential_shaping", 0.0)),
+                "reward_congestion_penalty": float(info.get("reward_congestion_penalty", 0.0)),
+                "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
+            }
+        reward_terms["reward_total"] = reward_total
+        reward_components_raw = info.get("reward_components_raw")
+        if isinstance(reward_components_raw, dict):
+            reward_terms.update(reward_components_raw)
+        if "reward_potential_shaping_raw" not in reward_terms:
+            reward_terms["reward_potential_shaping_raw"] = float(
+                info.get("reward_potential_shaping_raw", 0.0)
+            )
+        alpha = float(info.get("reward_potential_alpha", getattr(self.env.config, "reward_potential_alpha", 0.0)))
+        required_keys = [
+            "reward_potential_alpha",
+            "reward_potential_alpha_source",
+            "reward_potential_lost_weight",
+            "reward_potential_scale_with_reward_scale",
+            "phi_before",
+            "phi_after",
+            "phi_delta",
+            "phi_backlog_before",
+            "phi_backlog_after",
+            "lost_total_before",
+            "lost_total_after",
+            "waiting_churned_before",
+            "waiting_churned_after",
+            "onboard_churned_before",
+            "onboard_churned_after",
+            "structural_unserviceable_before",
+            "structural_unserviceable_after",
+            "waiting_remaining_before",
+            "waiting_remaining_after",
+            "onboard_remaining_before",
+            "onboard_remaining_after",
+            "reward_potential_shaping",
+            "reward_potential_shaping_raw",
+        ]
+        missing_keys = []
+        for key in required_keys:
+            if info is None or key not in info:
+                missing_keys.append(key)
+        if missing_keys:
+            potential = getattr(self.env, "get_potential_debug", None)
+            if callable(potential):
+                info = dict(info) if info else {}
+                info.update(potential())
+                missing_keys = []
+                for key in required_keys:
+                    if key not in info:
+                        missing_keys.append(key)
+        required_reward_terms = [
+            "reward_total",
+            "reward_potential_shaping",
+            "reward_potential_shaping_raw",
+        ]
+        for key in required_reward_terms:
+            if key not in reward_terms:
+                missing_keys.append(f"reward_terms.{key}")
+        payload = {
+            "type": "step",
+            "step": int(step),
+            "global_step": int(self.global_step),
+            "episode_index": int(episode_index),
+            "episode_steps": int(episode_steps),
+            "epsilon": float(epsilon),
+            "build_id": self._build_id,
+            "seed": int(self.config.seed),
+            "current_time": float(getattr(self.env, "current_time", 0.0)),
+            "active_vehicle_id": getattr(self.env, "active_vehicle_id", None),
+            "ready_vehicles": int(len(getattr(self.env, "ready_vehicle_ids", []))),
+            "event_queue_len": int(len(getattr(self.env, "event_queue", []))),
+            "env_steps": int(getattr(self.env, "steps", 0)),
+            "current_stop": int(current_stop),
+            "action_stop": int(action) if action is not None else None,
+            "action_index": action_idx,
+            "done": bool(done),
+            "done_reason": info.get("done_reason"),
+            "vehicles": vehicles,
+            "reward_terms": reward_terms,
+            "reward_total": float(reward_terms["reward_total"]),
+            "reward_potential_alpha": alpha,
+            "reward_potential_alpha_source": str(info.get("reward_potential_alpha_source", "unknown")),
+            "reward_potential_lost_weight": float(info.get("reward_potential_lost_weight", 0.0)),
+            "reward_potential_scale_with_reward_scale": bool(
+                info.get("reward_potential_scale_with_reward_scale", False)
+            ),
+            "step_served": float(info.get("step_served", 0.0)),
+            "step_waiting_timeouts": float(info.get("step_waiting_timeouts", 0.0)),
+            "step_waiting_churned": float(info.get("step_waiting_churned", 0.0)),
+            "step_onboard_churned": float(info.get("step_onboard_churned", 0.0)),
+            "step_waiting_churn_prob_mean": float(info.get("step_waiting_churn_prob_mean", 0.0)),
+            "step_onboard_churn_prob_mean": float(info.get("step_onboard_churn_prob_mean", 0.0)),
+            "action_count": int(len(actions)),
+            "action_valid_ratio": action_valid_ratio,
+            "stop_ratio": stop_ratio,
+            "served_per_decision": served_per_decision,
+            "waiting_churn_per_decision": waiting_churn_per_decision,
+            "invalid_action_ratio": invalid_action_ratio,
+            "reward_nonzero_ratio": reward_nonzero_ratio,
+            "served": float(info.get("served", 0.0)),
+            "waiting_churned": float(info.get("waiting_churned", 0.0)),
+            "onboard_churned": float(info.get("onboard_churned", 0.0)),
+            "waiting_remaining": float(info.get("waiting_remaining", 0.0)),
+            "onboard_remaining": float(info.get("onboard_remaining", 0.0)),
+            "waiting_remaining_before": float(info.get("waiting_remaining_before", 0.0)),
+            "waiting_remaining_after": float(info.get("waiting_remaining_after", 0.0)),
+            "onboard_remaining_before": float(info.get("onboard_remaining_before", 0.0)),
+            "onboard_remaining_after": float(info.get("onboard_remaining_after", 0.0)),
+            "lost_total_before": float(info.get("lost_total_before", 0.0)),
+            "lost_total_after": float(info.get("lost_total_after", 0.0)),
+            "waiting_churned_before": float(info.get("waiting_churned_before", 0.0)),
+            "waiting_churned_after": float(info.get("waiting_churned_after", 0.0)),
+            "onboard_churned_before": float(info.get("onboard_churned_before", 0.0)),
+            "onboard_churned_after": float(info.get("onboard_churned_after", 0.0)),
+            "structural_unserviceable_before": float(info.get("structural_unserviceable_before", 0.0)),
+            "structural_unserviceable_after": float(info.get("structural_unserviceable_after", 0.0)),
+            "phi_backlog_before": float(info.get("phi_backlog_before", 0.0)),
+            "phi_backlog_after": float(info.get("phi_backlog_after", 0.0)),
+            "phi_before": float(info.get("phi_before", 0.0)),
+            "phi_after": float(info.get("phi_after", 0.0)),
+            "phi_delta": float(info.get("phi_delta", 0.0)),
+            "action_mask_valid_count": int(mask.sum()) if len(mask) > 0 else 0,
+            "action_mask": mask.tolist(),
+            "action_candidates": actions.tolist(),
+            "missing_keys": missing_keys,
+            **entropy_stats,
+        }
+        payload["alerts"] = self._alert_detector.update(payload)
+        self._viz.publish(payload)
 
     def _compute_node_embeddings(self, obs: np.ndarray, model: Optional[nn.Module] = None, requires_grad: bool = True) -> torch.Tensor:
         """计算GNN节点嵌入（共享计算，避免重复前向传播）"""
@@ -658,6 +956,21 @@ class DQNTrainer:
             mask = features["action_mask"].astype(bool)
             step_stuckness = float((~mask).mean()) if len(mask) else 1.0
             action = self._select_action(features, epsilon=eps)
+            invalid_action = False
+            if action is not None:
+                actions = features["actions"].astype(np.int64)
+                if len(actions) == 0:
+                    invalid_action = True
+                    action = None
+                else:
+                    matches = np.where(actions == int(action))[0]
+                    if len(matches) == 0 or not bool(mask[int(matches[0])]):
+                        invalid_action = True
+                        valid = np.where(mask)[0]
+                        if len(valid) > 0:
+                            action = int(actions[int(valid[0])])
+                        else:
+                            action = None
             stepped = True
             if action is None:
                 actions = features["actions"].astype(np.int64)
@@ -678,6 +991,17 @@ class DQNTrainer:
                     info["waiting_remaining"] = float(waiting_rem)
                     info["onboard_remaining"] = float(onboard_rem)
                     info["waiting_timeouts"] = float(waiting_timeouts)
+                    info["reward_total"] = float(reward)
+                    info["reward_components"] = {
+                        "reward_terminal_backlog_penalty": float(-terminal_penalty),
+                        "reward_potential_shaping": 0.0,
+                    }
+                    info["reward_components_raw"] = {
+                        "reward_potential_shaping_raw": 0.0,
+                    }
+                    potential = getattr(self.env, "get_potential_debug", None)
+                    if callable(potential):
+                        info.update(potential())
                     
                     # 【关键】即使 stepped=False，也必须将惩罚计入 episode_return
                     episode_return += float(reward)
@@ -695,26 +1019,74 @@ class DQNTrainer:
                 episode_steps += 1
                 if info:
                     last_info = dict(info)
+                if invalid_action and info is not None:
+                    info["invalid_action"] = 1.0
+                self._publish_viz(
+                    step=step,
+                    episode_index=episode_index,
+                    episode_steps=episode_steps,
+                    epsilon=eps,
+                    features=features,
+                    action=action,
+                    reward=float(reward),
+                    done=bool(done),
+                    info=dict(info) if info else {},
+                )
+            else:
+                if invalid_action and last_info is not None:
+                    last_info["invalid_action"] = 1.0
+                self._publish_viz(
+                    step=step,
+                    episode_index=episode_index,
+                    episode_steps=episode_steps,
+                    epsilon=eps,
+                    features=features,
+                    action=None,
+                    reward=float(reward),
+                    done=bool(done),
+                    info=dict(last_info) if last_info else {},
+                )
 
             if step % 50 == 0:
+                reward_components = info.get("reward_components") if info else None
+                if isinstance(reward_components, dict) and reward_components:
+                    reward_terms_payload = dict(reward_components)
+                    reward_terms_payload.update(info.get("reward_components_raw", {}))
+                    reward_terms_payload["reward_total"] = float(info.get("reward_total", reward))
+                else:
+                    reward_terms_payload = {
+                        "reward_total": float(info.get("reward_total", reward)),
+                        "reward_base_service": float(info.get("reward_base_service", 0.0)),
+                        "reward_waiting_churn_penalty": float(info.get("reward_waiting_churn_penalty", 0.0)),
+                        "reward_fairness_penalty": float(info.get("reward_fairness_penalty", 0.0)),
+                        "reward_cvar_penalty": float(info.get("reward_cvar_penalty", 0.0)),
+                        "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
+                        "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
+                        "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
+                        "reward_backlog_penalty": float(info.get("reward_backlog_penalty", 0.0)),
+                        "reward_waiting_time_penalty": float(info.get("reward_waiting_time_penalty", 0.0)),
+                        "reward_potential_shaping": float(info.get("reward_potential_shaping", 0.0)),
+                        "reward_potential_shaping_raw": float(info.get("reward_potential_shaping_raw", 0.0)),
+                        "reward_congestion_penalty": float(info.get("reward_congestion_penalty", 0.0)),
+                        "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
+                    }
+                reward_terms_payload.setdefault(
+                    "reward_potential_shaping_raw",
+                    float(info.get("reward_potential_shaping_raw", 0.0)),
+                )
                 reward_payload = {
                     "type": "reward_terms",
                     "step": int(step),
                     "episode_index": int(episode_index),
-                    "reward_total": float(info.get("reward_total", reward)),
-                    "reward_base_service": float(info.get("reward_base_service", 0.0)),
-                    "reward_waiting_churn_penalty": float(info.get("reward_waiting_churn_penalty", 0.0)),
-                    "reward_fairness_penalty": float(info.get("reward_fairness_penalty", 0.0)),
-                    "reward_cvar_penalty": float(info.get("reward_cvar_penalty", 0.0)),
-                    "reward_travel_cost": float(info.get("reward_travel_cost", 0.0)),
-                    "reward_onboard_delay_penalty": float(info.get("reward_onboard_delay_penalty", 0.0)),
-                    "reward_onboard_churn_penalty": float(info.get("reward_onboard_churn_penalty", 0.0)),
-                    "reward_congestion_penalty": float(info.get("reward_congestion_penalty", 0.0)),
-                    "reward_tacc_bonus": float(info.get("reward_tacc_bonus", 0.0)),
+                    **reward_terms_payload,
+                    "reward_scale": float(info.get("reward_scale", 1.0)),
                     "dst_density_raw": float(info.get("dst_density_raw", 0.0)),
                     "fleet_potential_dst": float(info.get("fleet_potential_dst", 0.0)),
                     "step_travel_time_sec": float(info.get("step_travel_time_sec", 0.0)),
                     "step_stuckness": float(step_stuckness),
+                    "step_waiting_time_sec": float(info.get("step_waiting_time_sec", 0.0)),
+                    "step_waiting_churn_prob_mean": float(info.get("step_waiting_churn_prob_mean", 0.0)),
+                    "step_onboard_churn_prob_mean": float(info.get("step_onboard_churn_prob_mean", 0.0)),
                 }
                 self._reward_log_handle.write(json.dumps(reward_payload, ensure_ascii=False) + "\n")
             if step % int(cfg.log_every_steps) == 0:

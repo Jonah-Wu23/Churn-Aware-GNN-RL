@@ -29,30 +29,30 @@
 
 > **背景**：L3训练已完成但未收敛（rho≈0.28，远低于trigger_rho=0.8）。L1/L2被"超时推进"而非"达标换关"，phase3出现明显回撤。
 
-### 0.1 修复关卡转换机制
-- [ ] **禁止超时换关**：修改curriculum逻辑，仅当rho达标时才触发stage transition
-- [ ] 增加 `stage_max_steps` 或让转场更严格依赖 `trigger_rho`
-- [ ] 添加日志警告：当接近max_steps但rho未达标时发出提示
+### 0.1 修复关卡转换机制 ✅ (2026-01-22)
+- [x] **禁止超时换关**：`require_rho_transition=True`，支持 fail_fast/forced 策略
+- [x] 增加 `stage_max_steps`、`stage_extension_steps`、`max_stage_extensions` 配置
+- [x] 添加日志警告：当接近max_steps但rho未达标时发出提示
 
-### 0.2 修复epsilon重置问题
-- [ ] **排查L3 epsilon回跳到0.99的原因**（进入L3后探索率被重置/拉高）
-- [ ] 确保跨phase时epsilon继承而非重置
-- [ ] 验证fix：L3 phase2→phase3时epsilon应平滑衰减
+### 0.2 修复epsilon重置问题 ✅ (2026-01-22)
+- [x] **排查L3 epsilon回跳原因**：`global_step` 跨phase保持连续
+- [x] 确保跨phase时epsilon继承：`epsilon_by_stage` 配置 + `model._global_step` 传递
+- [x] 验证fix：L3 phase2→phase3时epsilon平滑衰减
 
-### 0.3 修复phase3奖励切换导致的回撤
-- [ ] **phase3 env_overrides为空→回到默认奖励权重**，需改为渐进过渡
-- [ ] 延长phase2或让phase3变化更渐进（不要一次性切换）
-- [ ] 考虑phase间奖励权重线性插值过渡
+### 0.3 修复phase3奖励切换导致的回撤 ✅ (2026-01-22)
+- [x] **实现渐进过渡**：`reward_ramp.py` 模块实现线性插值
+- [x] 公式：`alpha = phase_step / reward_ramp_steps`，`weight = (1-alpha)*W2 + alpha*W3`
+- [x] phase间奖励权重线性插值过渡
 
-### 0.4 改进模型选择策略
-- [ ] **停止用"训练中单局service_rate极值"选模型**（易被低需求幸运局骗）
-- [ ] 实现**固定seed评估选模**：
-  - 每隔N步用3-5个固定seeds、epsilon=0评估
+### 0.4 改进模型选择策略 ✅ (2026-01-22)
+- [x] **停止用训练极值选模型**：改用 `evaluation_checkpointer.py`
+- [x] 实现**固定seed评估选模**：
+  - `eval_seeds: [42, 123, 456, 789, 1000]`，epsilon=0
   - 用评估rho均值选best checkpoint
-- [ ] 选模准则改为：优先最大化rho，其次service_rate
-- [ ] 每个stage保留3个checkpoint：`best_rho`, `best_service_rate`, `last`
+- [x] 选模准则：mean_rho 为主，service_rate 为次
+- [x] 保留 `best_rho`, `best_service_rate`, `last` checkpoint
 
-### 0.5 验收标准
+### 0.5 验收标准 ⏳ (待实际训练验证)
 - [ ] L1/L2不再超时推进，必须rho≥trigger才换关
 - [ ] L3 phase切换时epsilon连续、奖励渐进
 - [ ] 使用固定seed评估选出的best模型，rho≥0.5
