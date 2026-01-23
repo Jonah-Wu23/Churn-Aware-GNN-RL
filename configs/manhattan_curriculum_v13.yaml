@@ -29,7 +29,7 @@ mapping:
 
 env:
   max_horizon_steps: 6000
-  mask_alpha: 1.5
+  mask_alpha: 3.0
   walk_threshold_sec: 600
   max_requests: 1500
   seed: 7
@@ -114,7 +114,10 @@ train:
     alerts:
       enabled: true
       debug_abort_on_alert: true
-      abort_levels: ["high"]
+      abort_codes:
+        - active_stop_mismatch
+        - time_feature_mismatch
+        - overload_deadlock
       debug_dump_dir: "reports/debug/potential_alerts"
       alert_buffer_size: 50
       no_service_positive_reward_epsilon: 0.1
@@ -194,7 +197,7 @@ sumo:
 curriculum:
   stages: [L0, L1, L2, L3]
   strict_stage_params: true  # Fail-fast mode for unrecognized stage_params fields
-  trigger_rho: 0.25
+  trigger_service_rate: 0.7
   gamma: 1.0
   stage_max_steps: 50000
   stage_steps:
@@ -202,17 +205,17 @@ curriculum:
   stage_min_episodes: 3
   
   # Rho-gated transition settings
-  rho_window_size: 5
-  require_rho_transition: true
-  rho_gate_source: "auto"
-  stage_rho_gate_source:
+  service_rate_window_size: 5
+  require_service_rate_transition: true
+  service_rate_gate_source: "auto"
+  stage_service_rate_gate_source:
     L2: "train"
-  stage_require_rho:
+  stage_require_service_rate:
     L0: false
   stage_extension_steps: 30000
   max_stage_extensions: 2
   fail_policy: "fail_fast"
-  rho_warning_threshold: 0.35  # 70% of trigger_rho
+  service_rate_warning_threshold: 0.35  # 70% of trigger_service_rate
   
   # Collapse protection
   collapse_drop_delta: 0.10
@@ -330,7 +333,7 @@ curriculum:
         max_horizon_steps: 6000
         max_sim_time_sec: 3600.0
     L2:
-      density_multiplier: 1.2
+      density_multiplier: 0.5
       time_scale: 0.8
       center_ratio: 0.8
       center_quantile: 0.3
@@ -340,6 +343,7 @@ curriculum:
       churn_tol_override_sec: 1200
       env_overrides:
         allow_stop_when_actions_exist: false
+        num_vehicles: 100
         reward_waiting_churn_penalty: 1.0
         reward_terminal_backlog_penalty: 10.0
         reward_scale: 30.0
@@ -350,6 +354,8 @@ curriculum:
         reward_step_backlog_penalty: 0.003
         reward_waiting_time_penalty_per_sec: 0.00003
         reward_congestion_penalty: 0.10
+        reward_onboard_delay_weight: 0.5
+        reward_waiting_time_penalty_per_sec: 0.00015
         reward_potential_alpha: 0.05
         reward_potential_lost_weight: 1.0
         reward_potential_scale_with_reward_scale: false

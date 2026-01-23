@@ -7,7 +7,7 @@ import json
 import threading
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 try:
     import zmq
@@ -17,6 +17,7 @@ except ImportError as exc:  # pragma: no cover
 try:
     import dash
     from dash import dcc, html
+    from dash.dependencies import Input, Output
 except ImportError as exc:  # pragma: no cover
     raise SystemExit("dash is required for realtime viz.") from exc
 
@@ -73,6 +74,8 @@ class StreamState:
         self.waiting_churn_prob_mean = deque(maxlen=2000)
         self.onboard_churn_prob_mean = deque(maxlen=2000)
         self.reward_components = {key: deque(maxlen=2000) for key in REWARD_COMPONENT_KEYS}
+        self.action_valid_count_history = deque(maxlen=2000)
+        self.action_valid_ratio_history = deque(maxlen=2000)
 
     def update(self, payload: Dict[str, Any]) -> None:
         with self.lock:
@@ -97,6 +100,8 @@ class StreamState:
             self.event_flags.append(1.0 if event_count > 0.0 else 0.0)
             self.waiting_churn_prob_mean.append(float(payload.get("step_waiting_churn_prob_mean", 0.0)))
             self.onboard_churn_prob_mean.append(float(payload.get("step_onboard_churn_prob_mean", 0.0)))
+            self.action_valid_count_history.append(int(payload.get("action_mask_valid_count", 0)))
+            self.action_valid_ratio_history.append(float(payload.get("action_valid_ratio", 0.0)))
 
 
 def _start_receiver(state: StreamState, zmq_url: str, topic: str) -> threading.Thread:
@@ -125,29 +130,9 @@ def _start_receiver(state: StreamState, zmq_url: str, topic: str) -> threading.T
     return thread
 
 
-
-
-def _make_series_figure(xs: list, ys: list, title: str, color: str) -> go.Figure:
-    fig = go.Figure()
-    if xs and ys:
-        fig.add_trace(
-            go.Scattergl(
-                x=xs,
-                y=ys,
-                mode="lines",
-                line=dict(color=color, width=2),
-            )
-        )
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        title=title,
-        xaxis=dict(title="global_step"),
-        yaxis=dict(title=title),
-        plot_bgcolor="#f4f3ef",
-        paper_bgcolor="#f4f3ef",
-    )
-    return fig
-
+# -----------------------------------------------------------------------------
+# Formatting & Computation Helpers
+# -----------------------------------------------------------------------------
 
 def _rolling_mean(values: list, window: int) -> list:
     if not values:
@@ -164,43 +149,93 @@ def _rolling_mean(values: list, window: int) -> list:
     return out
 
 
+# -----------------------------------------------------------------------------
+# Modern Visuals (Figures)
+# -----------------------------------------------------------------------------
+
+COLOR_AXIS = "#94a3b8"  # slate-400
+COLOR_GRID = "#334155"  # slate-700 (faint)
+FONT_FAMILY = "Inter, system-ui, sans-serif"
+BG_PAPER = "rgba(0,0,0,0)"
+BG_PLOT = "rgba(0,0,0,0)"
+
+def _apply_dark_theme(fig: go.Figure, title: str, y_title: str = None) -> None:
+    fig.update_layout(
+        template="plotly_dark",
+        margin=dict(l=40, r=20, t=40, b=40),
+        title=dict(text=title, font=dict(size=14, color="#e2e8f0")),
+        xaxis=dict(
+            title="Global Step", 
+            showgrid=False, 
+            color=COLOR_AXIS
+        ),
+        yaxis=dict(
+            title=y_title if y_title else title, 
+            gridcolor=COLOR_GRID, 
+            color=COLOR_AXIS,
+            showgrid=True
+        ),
+        plot_bgcolor=BG_PLOT,
+        paper_bgcolor=BG_PAPER,
+        hovermode="x unified",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            bgcolor="rgba(0,0,0,0)"
+        )
+    )
+
+def _make_series_figure(xs: list, ys: list, title: str, color: str) -> go.Figure:
+    fig = go.Figure()
+    if xs and ys:
+        fig.add_trace(
+            go.Scattergl(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line=dict(color=color, width=2),
+                fill='tozeroy',  # Area chart effect
+                fillcolor=color.replace(")", ", 0.1)").replace("rgb", "rgba") if "rgb" in color else color,
+            )
+        )
+    _apply_dark_theme(fig, title)
+    return fig
+
+
 def _make_components_figure(steps: list, components: Dict[str, list]) -> go.Figure:
     fig = go.Figure()
+    # Cyberpunk palette
     palette = [
-        "#1f6f8b",
-        "#8c2f39",
-        "#5a7f37",
-        "#d65f5f",
-        "#7a8c6d",
-        "#556b2f",
-        "#b85c38",
-        "#2a9d8f",
-        "#e9c46a",
-        "#264653",
-        "#9b5de5",
+        "#22d3ee", # cyan-400
+        "#f472b6", # pink-400
+        "#a78bfa", # violet-400
+        "#34d399", # emerald-400
+        "#fbbf24", # amber-400
+        "#f87171", # red-400
+        "#60a5fa", # blue-400
+        "#c084fc", # purple-400
+        "#e879f9", # fuchsia-400
+        "#818cf8", # indigo-400
     ]
+    
     for idx, key in enumerate(REWARD_COMPONENT_KEYS):
         ys = components.get(key, [])
         if not ys:
             continue
+        # Only show last non-zero values effectively? No, show all history
         fig.add_trace(
             go.Scattergl(
                 x=steps,
                 y=ys,
                 mode="lines",
                 line=dict(color=palette[idx % len(palette)], width=1.5),
-                name=key,
+                name=key.replace("reward_", ""),
             )
         )
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        title="reward_components",
-        xaxis=dict(title="global_step"),
-        yaxis=dict(title="value"),
-        plot_bgcolor="#f4f3ef",
-        paper_bgcolor="#f4f3ef",
-        legend=dict(orientation="h"),
-    )
+    _apply_dark_theme(fig, "Reward Components", "Value")
     return fig
 
 
@@ -213,18 +248,14 @@ def _make_event_rate_figure(steps: list, event_flags: list, window: int) -> go.F
                 x=steps,
                 y=rates,
                 mode="lines",
-                line=dict(color="#2a9d8f", width=2),
+                line=dict(color="#2dd4bf", width=2), # teal-400
+                name="Rate",
+                fill='tozeroy',
+                fillcolor="rgba(45, 212, 191, 0.1)"
             )
         )
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        title=f"effective_event_rate (window={window})",
-        xaxis=dict(title="global_step"),
-        yaxis=dict(title="rate"),
-        plot_bgcolor="#f4f3ef",
-        paper_bgcolor="#f4f3ef",
-        yaxis_range=[0.0, 1.0],
-    )
+    _apply_dark_theme(fig, f"Effective Event Rate (w={window})", "Rate")
+    fig.update_yaxes(range=[0.0, 1.0])
     return fig
 
 
@@ -236,8 +267,8 @@ def _make_churn_prob_figure(steps: list, waiting_means: list, onboard_means: lis
                 x=steps,
                 y=waiting_means,
                 mode="lines",
-                line=dict(color="#1f6f8b", width=2),
-                name="waiting_churn_prob_mean",
+                line=dict(color="#38bdf8", width=2), # sky-400
+                name="Waiting Churn",
             )
         )
     if steps and onboard_means:
@@ -246,190 +277,248 @@ def _make_churn_prob_figure(steps: list, waiting_means: list, onboard_means: lis
                 x=steps,
                 y=onboard_means,
                 mode="lines",
-                line=dict(color="#d65f5f", width=2),
-                name="onboard_churn_prob_mean",
+                line=dict(color="#f43f5e", width=2), # rose-500
+                name="Onboard Churn",
             )
         )
-    fig.update_layout(
-        margin=dict(l=10, r=10, t=30, b=10),
-        title="churn_prob_mean",
-        xaxis=dict(title="global_step"),
-        yaxis=dict(title="probability"),
-        plot_bgcolor="#f4f3ef",
-        paper_bgcolor="#f4f3ef",
-        legend=dict(orientation="h"),
-    )
+    _apply_dark_theme(fig, "Churn Probabilities", "Prob")
     return fig
 
+# -----------------------------------------------------------------------------
+# UI Components
+# -----------------------------------------------------------------------------
 
-def _format_value(latest: Dict[str, Any], key: str, fmt: str) -> str:
-    if key not in latest:
-        return "MISSING"
-    value = latest.get(key)
-    try:
-        return fmt.format(value)
-    except Exception:
-        return "MISSING"
+STATS_CARD_STYLE = {
+    "backgroundColor": "#1e293b", # slate-800
+    "borderRadius": "8px",
+    "padding": "16px",
+    "border": "1px solid #334155", # slate-700
+    "boxShadow": "0 4px 6px -1px rgba(0, 0, 0, 0.3)",
+    "display": "flex",
+    "flexDirection": "column",
+    "minWidth": "140px",
+    "flex": "1"
+}
 
+STATS_LABEL_STYLE = {
+    "color": "#94a3b8", # slate-400
+    "fontSize": "12px",
+    "fontWeight": "600",
+    "textTransform": "uppercase",
+    "letterSpacing": "0.05em",
+    "marginBottom": "4px"
+}
 
-def _format_reward_term(latest: Dict[str, Any], key: str, fmt: str) -> str:
-    reward_terms = latest.get("reward_terms")
-    if not isinstance(reward_terms, dict) or key not in reward_terms:
-        return "MISSING"
-    try:
-        return fmt.format(reward_terms.get(key))
-    except Exception:
-        return "MISSING"
+STATS_VALUE_STYLE = {
+    "color": "#f1f5f9", # slate-100
+    "fontSize": "24px",
+    "fontWeight": "700",
+    "fontFamily": "Monaco, Consolas, monospace"
+}
 
+STATS_SUB_STYLE = {
+    "color": "#64748b", # slate-500
+    "fontSize": "12px",
+    "marginTop": "4px"
+}
 
-def _format_metrics(latest: Optional[Dict[str, Any]]) -> str:
-    if not latest:
-        return "Waiting for data..."
-    alerts = latest.get("alerts", [])
-    alert_lines = []
-    if alerts:
-        for alert in alerts:
-            code = alert.get("code", "unknown")
-            severity = alert.get("severity", "n/a")
-            message = alert.get("message", "")
-            dump_path = alert.get("dump_path")
-            suffix = f" (dump={dump_path})" if dump_path else ""
-            alert_lines.append(f"- [{severity}] {code}: {message}{suffix}")
-    alert_block = "\n".join(alert_lines) if alert_lines else "none"
-    lines = [
-        f"build_id: {_format_value(latest, 'build_id', '{}')}",
-        f"global_step: {_format_value(latest, 'global_step', '{:d}')}",
-        f"episode: {_format_value(latest, 'episode_index', '{:d}')} / steps: {_format_value(latest, 'episode_steps', '{:d}')}",
-        f"sim_time_sec: {_format_value(latest, 'current_time', '{:.1f}')}",
-        f"active_vehicle_id: {_format_value(latest, 'active_vehicle_id', '{}')}",
-        f"ready_vehicles: {_format_value(latest, 'ready_vehicles', '{:d}')}",
-        f"event_queue_len: {_format_value(latest, 'event_queue_len', '{:d}')}",
-        f"env_steps: {_format_value(latest, 'env_steps', '{:d}')}",
-        f"epsilon: {_format_value(latest, 'epsilon', '{:.3f}')}",
-        f"reward_total: {_format_reward_term(latest, 'reward_total', '{:.3f}')}",
-        f"served: {_format_value(latest, 'served', '{:.1f}')}",
-        f"waiting_churned: {_format_value(latest, 'waiting_churned', '{:.1f}')}",
-        f"onboard_churned: {_format_value(latest, 'onboard_churned', '{:.1f}')}",
-        f"waiting_remaining: {_format_value(latest, 'waiting_remaining', '{:.1f}')}",
-        f"onboard_remaining: {_format_value(latest, 'onboard_remaining', '{:.1f}')}",
-        f"q_entropy: {_format_value(latest, 'q_entropy', '{:.3f}')}",
-        f"q_entropy_norm: {_format_value(latest, 'q_entropy_norm', '{:.3f}')}",
-        f"epsilon_entropy: {_format_value(latest, 'epsilon_entropy', '{:.3f}')}",
-        f"waiting_churn_prob_mean: {_format_value(latest, 'step_waiting_churn_prob_mean', '{:.3e}')}",
-        f"onboard_churn_prob_mean: {_format_value(latest, 'step_onboard_churn_prob_mean', '{:.3e}')}",
-        f"reward_potential_alpha: {_format_value(latest, 'reward_potential_alpha', '{:.6f}')}",
-        f"reward_potential_alpha_source: {_format_value(latest, 'reward_potential_alpha_source', '{}')}",
-        f"reward_potential_lost_weight: {_format_value(latest, 'reward_potential_lost_weight', '{:.6f}')}",
-        f"reward_potential_scale_with_reward_scale: {_format_value(latest, 'reward_potential_scale_with_reward_scale', '{}')}",
-        f"phi_before: {_format_value(latest, 'phi_before', '{:.6e}')}",
-        f"phi_after: {_format_value(latest, 'phi_after', '{:.6e}')}",
-        f"phi_delta: {_format_value(latest, 'phi_delta', '{:.6e}')}",
-        f"phi_backlog_before: {_format_value(latest, 'phi_backlog_before', '{:.6e}')}",
-        f"phi_backlog_after: {_format_value(latest, 'phi_backlog_after', '{:.6e}')}",
-        f"lost_total_before: {_format_value(latest, 'lost_total_before', '{:.6e}')}",
-        f"lost_total_after: {_format_value(latest, 'lost_total_after', '{:.6e}')}",
-        f"waiting_churned_before: {_format_value(latest, 'waiting_churned_before', '{:.6e}')}",
-        f"waiting_churned_after: {_format_value(latest, 'waiting_churned_after', '{:.6e}')}",
-        f"onboard_churned_before: {_format_value(latest, 'onboard_churned_before', '{:.6e}')}",
-        f"onboard_churned_after: {_format_value(latest, 'onboard_churned_after', '{:.6e}')}",
-        f"structural_before: {_format_value(latest, 'structural_unserviceable_before', '{:.6e}')}",
-        f"structural_after: {_format_value(latest, 'structural_unserviceable_after', '{:.6e}')}",
-        f"waiting_before: {_format_value(latest, 'waiting_remaining_before', '{:.6e}')}",
-        f"waiting_after: {_format_value(latest, 'waiting_remaining_after', '{:.6e}')}",
-        f"onboard_before: {_format_value(latest, 'onboard_remaining_before', '{:.6e}')}",
-        f"onboard_after: {_format_value(latest, 'onboard_remaining_after', '{:.6e}')}",
-        f"reward_potential_shaping_raw: {_format_reward_term(latest, 'reward_potential_shaping_raw', '{:.6e}')}",
-        f"reward_potential_shaping: {_format_reward_term(latest, 'reward_potential_shaping', '{:.6e}')}",
-        f"action_count: {_format_value(latest, 'action_count', '{:d}')}",
-        f"action_valid_ratio: {_format_value(latest, 'action_valid_ratio', '{:.3f}')}",
-        f"stop_ratio: {_format_value(latest, 'stop_ratio', '{:.3f}')}",
-        f"served_per_decision: {_format_value(latest, 'served_per_decision', '{:.3f}')}",
-        f"waiting_churn_per_decision: {_format_value(latest, 'waiting_churn_per_decision', '{:.3f}')}",
-        f"invalid_action_ratio: {_format_value(latest, 'invalid_action_ratio', '{:.3f}')}",
-        f"reward_nonzero_ratio: {_format_value(latest, 'reward_nonzero_ratio', '{:.3f}')}",
-        f"action_stop: {_format_value(latest, 'action_stop', '{}')}",
-        f"done: {_format_value(latest, 'done', '{}')} ({_format_value(latest, 'done_reason', '{}')})",
-        "alerts:",
-        alert_block,
+def _make_stat_card(label: str, value: str, subtext: str = None, color: str = None) -> html.Div:
+    val_style = STATS_VALUE_STYLE.copy()
+    if color:
+        val_style["color"] = color
+    
+    children = [
+        html.Div(label, style=STATS_LABEL_STYLE),
+        html.Div(value, style=val_style),
     ]
-    return "\n".join(lines)
+    if subtext:
+        children.append(html.Div(subtext, style=STATS_SUB_STYLE))
+        
+    return html.Div(children, style=STATS_CARD_STYLE)
 
+def _format_val(d: Optional[Dict], k: str, f: str = "{}") -> str:
+    if not d or k not in d: return "-"
+    try: return f.format(d[k])
+    except: return str(d[k])
+
+# -----------------------------------------------------------------------------
+# Main Visual Update Logic
+# -----------------------------------------------------------------------------
+
+def _generate_layout(build_id: str) -> html.Div:
+    return html.Div(
+        style={
+            "backgroundColor": "#0f172a", # slate-900
+            "minHeight": "100vh",
+            "padding": "24px",
+            "fontFamily": "Inter, system-ui, sans-serif",
+            "color": "#e2e8f0",
+        },
+        children=[
+            # Header
+            html.Div(
+                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "24px"},
+                children=[
+                    html.Div([
+                        html.H1("EdgeQ Training Monitor", style={"margin": 0, "fontSize": "24px", "fontWeight": "800", "background": "linear-gradient(to right, #38bdf8, #818cf8)", "-webkit-background-clip": "text", "-webkit-text-fill-color": "transparent"}),
+                        html.Div(f"Build: {build_id}", style={"color": "#64748b", "fontSize": "12px", "marginTop": "4px"}),
+                    ]),
+                    html.Div(id="clock-display", style={"fontSize": "14px", "color": "#94a3b8"})
+                ]
+            ),
+            
+            # Top Stats Row
+            html.Div(
+                id="stats-row-1",
+                style={"display": "flex", "gap": "12px", "marginBottom": "12px", "flexWrap": "wrap"},
+                children="waiting for data..." 
+            ),
+             # Second Stats Row
+            html.Div(
+                id="stats-row-2",
+                style={"display": "flex", "gap": "12px", "marginBottom": "24px", "flexWrap": "wrap"},
+                children="..." 
+            ),
+
+            # Main Grid
+            html.Div(
+                style={"display": "grid", "gridTemplateColumns": "repeat(auto-fit, minmax(450px, 1fr))", "gap": "24px"},
+                children=[
+                    # Large Reward Components Plot
+                    html.Div(
+                        style={"gridColumn": "1 / -1", "backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "16px", "border": "1px solid #334155"},
+                        children=[dcc.Graph(id="reward_components", style={"height": "400px"})]
+                    ),
+                    
+                    # 4 Quadrant Plots
+                    html.Div(style={"backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "12px", "border": "1px solid #334155"},
+                             children=[dcc.Graph(id="reward_total", style={"height": "300px"})]),
+                    html.Div(style={"backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "12px", "border": "1px solid #334155"},
+                             children=[dcc.Graph(id="entropy", style={"height": "300px"})]),
+                    html.Div(style={"backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "12px", "border": "1px solid #334155"},
+                             children=[dcc.Graph(id="event_rate", style={"height": "300px"})]),
+                    html.Div(style={"backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "12px", "border": "1px solid #334155"},
+                             children=[dcc.Graph(id="churn_prob", style={"height": "300px"})]),
+                             
+                    # Additional Analysis Plots
+                    html.Div(style={"backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "12px", "border": "1px solid #334155"},
+                             children=[dcc.Graph(id="action_valid_count", style={"height": "300px"})]),
+                    html.Div(style={"backgroundColor": "#1e293b", "borderRadius": "12px", "padding": "12px", "border": "1px solid #334155"},
+                             children=[dcc.Graph(id="action_valid_ratio", style={"height": "300px"})]),
+                ]
+            ),
+            
+            # Alert Log
+            html.Div(
+                style={"marginTop": "24px", "backgroundColor": "#1e293b", "borderRadius": "12px", "border": "1px solid #334155", "overflow": "hidden"},
+                children=[
+                    html.Div("System Alerts / Logs", style={"padding": "12px 16px", "borderBottom": "1px solid #334155", "fontWeight": "600", "color": "#94a3b8"}),
+                    html.Div(id="alert-log", style={"padding": "16px", "maxHeight": "200px", "overflowY": "auto", "fontFamily": "monospace", "fontSize": "13px"})
+                ]
+            ),
+
+            dcc.Interval(id="tick", interval=1000, n_intervals=0),
+        ]
+    )
 
 def main() -> None:
     args = parse_args()
     load_config(args.config)
     build_id = get_build_id()
     print(f"BUILD_ID={build_id}")
+    print(f"Listening on {args.zmq_url} for topic '{args.topic}'")
+    
     state = StreamState(history_len=args.history_len)
     _start_receiver(state, args.zmq_url, args.topic)
 
-    app = dash.Dash(__name__)
-    app.layout = html.Div(
-        style={
-            "backgroundColor": "#f4f3ef",
-            "padding": "12px",
-            "fontFamily": "Verdana, Geneva, sans-serif",
-            "color": "#2b2b2b",
-        },
-        children=[
-            html.Div(
-                style={"display": "flex", "gap": "12px", "flexWrap": "wrap"},
-                children=[
-                    html.Div(
-                        style={"flex": "1 1 360px", "minWidth": "320px"},
-                        children=[
-                            html.H2("Realtime Bus Training View"),
-                            html.Div(f"BUILD_ID: {build_id}", style={"fontWeight": "bold"}),
-                            html.Pre(id="metrics", style={"whiteSpace": "pre-wrap"}),
-                        ],
-                    ),
-                    html.Div(
-                        style={"flex": "2 1 640px", "minWidth": "320px"},
-                        children=[dcc.Graph(id="reward_components")],
-                    ),
-                ],
-            ),
-            html.Div(
-                style={"display": "flex", "gap": "12px", "marginTop": "12px", "flexWrap": "wrap"},
-                children=[
-                    html.Div(style={"flex": "1 1 420px"}, children=[dcc.Graph(id="reward_total")]),
-                    html.Div(style={"flex": "1 1 420px"}, children=[dcc.Graph(id="entropy")]),
-                    html.Div(style={"flex": "1 1 420px"}, children=[dcc.Graph(id="event_rate")]),
-                    html.Div(style={"flex": "1 1 420px"}, children=[dcc.Graph(id="churn_prob")]),
-                ],
-            ),
-            dcc.Interval(id="tick", interval=1000, n_intervals=0),
-        ],
-    )
+    app = dash.Dash(__name__, title="EdgeQ Monitor")
+    app.layout = _generate_layout(build_id)
 
     @app.callback(
         [
-            dash.Output("metrics", "children"),
-            dash.Output("reward_components", "figure"),
-            dash.Output("reward_total", "figure"),
-            dash.Output("entropy", "figure"),
-            dash.Output("event_rate", "figure"),
-            dash.Output("churn_prob", "figure"),
+            Output("stats-row-1", "children"),
+            Output("stats-row-2", "children"),
+            Output("clock-display", "children"),
+            Output("alert-log", "children"),
+            Output("reward_components", "figure"),
+            Output("reward_total", "figure"),
+            Output("entropy", "figure"),
+            Output("event_rate", "figure"),
+            Output("churn_prob", "figure"),
+            Output("action_valid_count", "figure"),
+            Output("action_valid_ratio", "figure"),
         ],
-        [dash.Input("tick", "n_intervals")],
+        [Input("tick", "n_intervals")],
     )
     def _update(_n: int):
         with state.lock:
             latest = dict(state.latest) if state.latest else None
             steps = list(state.step_history)
+            
+            # Snapshots for plotting
             rewards = list(state.reward_history)
             entropies = list(state.entropy_history)
             event_flags = list(state.event_flags)
             waiting_churn_means = list(state.waiting_churn_prob_mean)
             onboard_churn_means = list(state.onboard_churn_prob_mean)
             reward_components = {key: list(value) for key, value in state.reward_components.items()}
-        metrics = _format_metrics(latest)
-        fig_reward_components = _make_components_figure(steps, reward_components)
-        fig_reward = _make_series_figure(steps, rewards, "reward_total", "#1f6f8b")
-        fig_entropy = _make_series_figure(steps, entropies, "q_entropy", "#d65f5f")
-        fig_event_rate = _make_event_rate_figure(steps, event_flags, window=200)
-        fig_churn_prob = _make_churn_prob_figure(steps, waiting_churn_means, onboard_churn_means)
-        return metrics, fig_reward_components, fig_reward, fig_entropy, fig_event_rate, fig_churn_prob
+            action_valid_counts = list(state.action_valid_count_history)
+            action_valid_ratios = list(state.action_valid_ratio_history)
+
+        # 1. Stats Rows
+        if not latest:
+            return ([], [], "Waiting...", "No data received yet.", go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure(), go.Figure())
+        
+        reward_terms = latest.get("reward_terms")
+        if not isinstance(reward_terms, dict):
+            reward_terms = {}
+        r_val = reward_terms.get("reward_total", 0.0)
+
+        # Row 1: High Level
+        row1 = [
+            _make_stat_card("Episode", f"{_format_val(latest, 'episode_index')} / {_format_val(latest, 'episode_steps')}", "Steps", "#60a5fa"),
+            _make_stat_card("Global Step", _format_val(latest, 'global_step', '{:,}'), color="#c084fc"),
+            _make_stat_card("Epsilon", _format_val(latest, 'epsilon', '{:.4f}'), "Exploration", "#fbbf24"),
+            _make_stat_card("Entropy", _format_val(latest, 'q_entropy', '{:.3f}'), f"Norm: {_format_val(latest, 'q_entropy_norm', '{:.2f}')}", "#f472b6"),
+            _make_stat_card("Reward Total", f"{float(r_val):.3f}", "Current Step", "#34d399"),
+        ]
+
+        # Row 2: Operational
+        row2 = [
+            _make_stat_card("Served", _format_val(latest, 'served', '{:.1f}'), "Pax", "#22d3ee"),
+            _make_stat_card("Waiting (Rem)", _format_val(latest, 'waiting_remaining', '{:.1f}'), f"Churn: {_format_val(latest, 'waiting_churned', '{:.1f}')}", "#f87171"),
+            _make_stat_card("Onboard (Rem)", _format_val(latest, 'onboard_remaining', '{:.1f}'), f"Churn: {_format_val(latest, 'onboard_churned', '{:.1f}')}", "#f87171"),
+            _make_stat_card("Active Vehicle", _format_val(latest, 'active_vehicle_id'), None, "#94a3b8"),
+            _make_stat_card("Action Ratio", _format_val(latest, 'action_valid_ratio', '{:.1%}'), f"Count: {_format_val(latest, 'action_mask_valid_count')}", "#a78bfa"),
+        ]
+
+        # 2. Clock
+        clock = f"Simon Time: {_format_val(latest, 'current_time', '{:.1f}')}s | Env Steps: {_format_val(latest, 'env_steps')}"
+
+        # 3. Alerts
+        alerts = latest.get("alerts", [])
+        alert_children = []
+        if alerts:
+            for alert in alerts:
+                sev = alert.get("severity", "info").upper()
+                col = "#ef4444" if sev == "ERROR" else "#eab308" if sev == "WARNING" else "#3b82f6"
+                alert_children.append(html.Div([
+                    html.Span(f"[{sev}] {alert.get('code')}: ", style={"color": col, "fontWeight": "bold"}),
+                    html.Span(alert.get('message'), style={"color": "#cbd5e1"})
+                ], style={"marginBottom": "4px"}))
+        else:
+            alert_children = html.Div("No active system alerts.", style={"color": "#475569", "fontStyle": "italic"})
+
+        # 4. Plots
+        fig_rc = _make_components_figure(steps, reward_components)
+        fig_rt = _make_series_figure(steps, rewards, "Total Reward", "#34d399")
+        fig_ent = _make_series_figure(steps, entropies, "Entropy", "#f472b6")
+        fig_er = _make_event_rate_figure(steps, event_flags, window=200)
+        fig_cp = _make_churn_prob_figure(steps, waiting_churn_means, onboard_churn_means)
+        fig_ac = _make_series_figure(steps, action_valid_counts, "Valid Action Count", "#fb923c") # orange
+        fig_ar = _make_series_figure(steps, action_valid_ratios, "Valid Action Ratio", "#2dd4bf") # teal
+
+        return row1, row2, clock, alert_children, fig_rc, fig_rt, fig_ent, fig_er, fig_cp, fig_ac, fig_ar
 
     app.run(host=args.host, port=args.port, debug=False)
 

@@ -7,7 +7,7 @@ from collections import deque
 import json
 import logging
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import random
 
 import numpy as np
@@ -208,6 +208,46 @@ class DQNTrainer:
         if callable(potential):
             info.update(potential())
         return info
+
+    def _collect_vehicle_snapshot(self) -> Tuple[List[Dict[str, object]], Dict[str, Dict[str, object]]]:
+        vehicles: List[Dict[str, object]] = []
+        vehicles_by_id: Dict[str, Dict[str, object]] = {}
+        for idx, vehicle in enumerate(getattr(self.env, "vehicles", [])):
+            vehicle_id = getattr(vehicle, "vehicle_id", idx)
+            current_stop = getattr(vehicle, "current_stop", -1)
+            available_time = getattr(vehicle, "available_time", getattr(self.env, "current_time", 0.0))
+            record = {
+                "vehicle_id": int(vehicle_id),
+                "current_stop": int(current_stop),
+                "available_time": float(available_time),
+                "onboard": int(len(getattr(vehicle, "onboard", []))),
+            }
+            vehicles.append(record)
+            vehicles_by_id[str(record["vehicle_id"])] = record
+        return vehicles, vehicles_by_id
+
+    def _collect_pre_step_snapshot(
+        self,
+        episode_index: int,
+        episode_steps: int,
+        step: int,
+    ) -> Dict[str, object]:
+        vehicles, vehicles_by_id = self._collect_vehicle_snapshot()
+        waiting_remaining = float(sum(len(q) for q in getattr(self.env, "waiting", {}).values()))
+        onboard_remaining = float(sum(len(v.onboard) for v in getattr(self.env, "vehicles", [])))
+        snapshot_id = f"{int(episode_index)}:{int(episode_steps)}:{int(step)}:{int(self.global_step)}"
+        return {
+            "snapshot_phase": "pre_step",
+            "snapshot_id": snapshot_id,
+            "pre_step_time": float(getattr(self.env, "current_time", 0.0)),
+            "active_vehicle_id": getattr(self.env, "active_vehicle_id", None),
+            "ready_vehicles": int(len(getattr(self.env, "ready_vehicle_ids", []))),
+            "event_queue_len": int(len(getattr(self.env, "event_queue", []))),
+            "waiting_remaining": waiting_remaining,
+            "onboard_remaining": onboard_remaining,
+            "vehicles": vehicles,
+            "vehicles_by_id": vehicles_by_id,
+        }
 
     def _compute_terminal_backlog_penalty(self) -> Tuple[float, float, float, float]:
         """计算终止积压惩罚（无有效动作时调用）。
@@ -515,12 +555,14 @@ class DQNTrainer:
         reward: float,
         done: bool,
         info: Dict[str, float],
+        pre_step_snapshot: Optional[Dict[str, object]] = None,
     ) -> None:
         if not self._viz.enabled:
             return
         if self._viz_cfg.publish_every_steps > 0 and step % int(self._viz_cfg.publish_every_steps) != 0:
             if not (done and self._viz_cfg.publish_on_episode_end):
                 return
+        snapshot = pre_step_snapshot or {}
         current_stop = int(features["current_stop"][0]) if len(features.get("current_stop", [])) else -1
         action_idx = None
         actions = features.get("actions", np.array([], dtype=np.int64)).astype(np.int64)
@@ -566,16 +608,16 @@ class DQNTrainer:
         waiting_churn_per_decision = float(waiting_churn_sum / max(1.0, decision_steps))
         invalid_action_ratio = float(invalid_count / window_len) if window_len > 0 else 0.0
         reward_nonzero_ratio = float(reward_nonzero_count / window_len) if window_len > 0 else 0.0
-        vehicles = []
-        for vehicle in getattr(self.env, "vehicles", []):
-            vehicles.append(
-                {
-                    "vehicle_id": int(vehicle.vehicle_id),
-                    "current_stop": int(vehicle.current_stop),
-                    "available_time": float(vehicle.available_time),
-                    "onboard": int(len(vehicle.onboard)),
-                }
-            )
+        vehicles = snapshot.get("vehicles")
+        vehicles_by_id = snapshot.get("vehicles_by_id")
+        if vehicles is None:
+            vehicles, vehicles_by_id = self._collect_vehicle_snapshot()
+        elif vehicles_by_id is None:
+            vehicles_by_id = {
+                str(vehicle.get("vehicle_id")): vehicle
+                for vehicle in vehicles
+                if isinstance(vehicle, dict) and "vehicle_id" in vehicle
+            }
         reward_total = float(info.get("reward_total", reward))
         reward_components = info.get("reward_components")
         if isinstance(reward_components, dict) and reward_components:
@@ -659,10 +701,13 @@ class DQNTrainer:
             "epsilon": float(epsilon),
             "build_id": self._build_id,
             "seed": int(self.config.seed),
-            "current_time": float(getattr(self.env, "current_time", 0.0)),
-            "active_vehicle_id": getattr(self.env, "active_vehicle_id", None),
-            "ready_vehicles": int(len(getattr(self.env, "ready_vehicle_ids", []))),
-            "event_queue_len": int(len(getattr(self.env, "event_queue", []))),
+            "snapshot_phase": str(snapshot.get("snapshot_phase", "unknown")),
+            "snapshot_id": snapshot.get("snapshot_id"),
+            "pre_step_time": float(snapshot.get("pre_step_time", getattr(self.env, "current_time", 0.0))),
+            "current_time": float(snapshot.get("pre_step_time", getattr(self.env, "current_time", 0.0))),
+            "active_vehicle_id": snapshot.get("active_vehicle_id", getattr(self.env, "active_vehicle_id", None)),
+            "ready_vehicles": int(snapshot.get("ready_vehicles", len(getattr(self.env, "ready_vehicle_ids", [])))),
+            "event_queue_len": int(snapshot.get("event_queue_len", len(getattr(self.env, "event_queue", [])))),
             "env_steps": int(getattr(self.env, "steps", 0)),
             "current_stop": int(current_stop),
             "action_stop": int(action) if action is not None else None,
@@ -670,6 +715,7 @@ class DQNTrainer:
             "done": bool(done),
             "done_reason": info.get("done_reason"),
             "vehicles": vehicles,
+            "vehicles_by_id": vehicles_by_id,
             "reward_terms": reward_terms,
             "reward_total": float(reward_terms["reward_total"]),
             "reward_potential_alpha": alpha,
@@ -694,8 +740,8 @@ class DQNTrainer:
             "served": float(info.get("served", 0.0)),
             "waiting_churned": float(info.get("waiting_churned", 0.0)),
             "onboard_churned": float(info.get("onboard_churned", 0.0)),
-            "waiting_remaining": float(info.get("waiting_remaining", 0.0)),
-            "onboard_remaining": float(info.get("onboard_remaining", 0.0)),
+            "waiting_remaining": float(snapshot.get("waiting_remaining", info.get("waiting_remaining", 0.0))),
+            "onboard_remaining": float(snapshot.get("onboard_remaining", info.get("onboard_remaining", 0.0))),
             "waiting_remaining_before": float(info.get("waiting_remaining_before", 0.0)),
             "waiting_remaining_after": float(info.get("waiting_remaining_after", 0.0)),
             "onboard_remaining_before": float(info.get("onboard_remaining_before", 0.0)),
@@ -716,6 +762,7 @@ class DQNTrainer:
             "action_mask_valid_count": int(mask.sum()) if len(mask) > 0 else 0,
             "action_mask": mask.tolist(),
             "action_candidates": actions.tolist(),
+            "mask_debug": getattr(self.env, "last_mask_debug", None),
             "missing_keys": missing_keys,
             **entropy_stats,
         }
@@ -953,6 +1000,7 @@ class DQNTrainer:
                 step_callback(self.global_step, int(step), self.env)
             
             features = self.env.get_feature_batch()
+            pre_step_snapshot = self._collect_pre_step_snapshot(episode_index, episode_steps, int(step))
             mask = features["action_mask"].astype(bool)
             step_stuckness = float((~mask).mean()) if len(mask) else 1.0
             action = self._select_action(features, epsilon=eps)
@@ -1031,6 +1079,7 @@ class DQNTrainer:
                     reward=float(reward),
                     done=bool(done),
                     info=dict(info) if info else {},
+                    pre_step_snapshot=pre_step_snapshot,
                 )
             else:
                 if invalid_action and last_info is not None:
@@ -1045,6 +1094,7 @@ class DQNTrainer:
                     reward=float(reward),
                     done=bool(done),
                     info=dict(last_info) if last_info else {},
+                    pre_step_snapshot=pre_step_snapshot,
                 )
 
             if step % 50 == 0:

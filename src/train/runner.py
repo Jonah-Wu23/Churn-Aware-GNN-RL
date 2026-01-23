@@ -1,4 +1,4 @@
-"""Training runner with structured curriculum and rho-based transitions."""
+"""Training runner with structured curriculum and service-rate-based transitions."""
 
 from __future__ import annotations
 
@@ -27,34 +27,36 @@ LOG = logging.getLogger(__name__)
 
 
 class StageFailedError(Exception):
-    """Raised when a stage fails to reach trigger_rho after max extensions."""
-    def __init__(self, stage: str, rho: float, trigger_rho: float):
+    """Raised when a stage fails to reach trigger_service_rate after max extensions."""
+    def __init__(self, stage: str, service_rate: float, trigger_service_rate: float):
         self.stage = stage
-        self.rho = rho
-        self.trigger_rho = trigger_rho
-        super().__init__(f"Stage {stage} failed: rho={rho:.4f} < trigger={trigger_rho:.4f}")
+        self.service_rate = service_rate
+        self.trigger_service_rate = trigger_service_rate
+        super().__init__(
+            f"Stage {stage} failed: service_rate={service_rate:.4f} < trigger={trigger_service_rate:.4f}"
+        )
 
 
 @dataclass
 class CurriculumConfig:
-    """Configuration for curriculum learning with rho-gated transitions."""
+    """Configuration for curriculum learning with service-rate-gated transitions."""
     stages: List[str] = field(default_factory=lambda: ["L0", "L1", "L2", "L3"])
-    trigger_rho: float = 0.5  # Changed from 0.8 to 0.5
+    trigger_service_rate: float = 0.5  # Changed from 0.8 to 0.5
     gamma: float = 1.0
     stage_max_steps: int = 50000
     stage_min_episodes: int = 3
     stage_steps: Dict[str, int] = field(default_factory=dict)
     
-    # Rho-gated transition settings
-    rho_window_size: int = 5
-    require_rho_transition: bool = True
+    # Service-rate-gated transition settings
+    service_rate_window_size: int = 5
+    require_service_rate_transition: bool = True
     stage_extension_steps: int = 30000
     max_stage_extensions: int = 2
     fail_policy: str = "fail_fast"  # "fail_fast" or "forced"
-    rho_warning_threshold: float = 0.35  # 70% of trigger_rho (0.5)
-    stage_require_rho: Dict[str, bool] = field(default_factory=dict)
-    rho_gate_source: str = "auto"  # "auto", "eval", "train", "max"
-    stage_rho_gate_source: Dict[str, str] = field(default_factory=dict)
+    service_rate_warning_threshold: float = 0.35  # 70% of trigger_service_rate (0.5)
+    stage_require_service_rate: Dict[str, bool] = field(default_factory=dict)
+    service_rate_gate_source: str = "auto"  # "auto", "eval", "train", "max"
+    stage_service_rate_gate_source: Dict[str, str] = field(default_factory=dict)
     
     # Collapse protection
     collapse_drop_delta: float = 0.10
@@ -272,11 +274,11 @@ def _compute_rho(log: Dict[str, float], gamma: float) -> float:
     return float(service_rate / (1.0 + gamma * stuckness))
 
 
-def _compute_rho_window_mean(rho_history: List[float], window_size: int) -> float:
-    """Compute mean rho over the last window_size episodes."""
-    if not rho_history:
+def _compute_service_rate_window_mean(service_rate_history: List[float], window_size: int) -> float:
+    """Compute mean service_rate over the last window_size episodes."""
+    if not service_rate_history:
         return 0.0
-    window = rho_history[-window_size:]
+    window = service_rate_history[-window_size:]
     return float(np.mean(window))
 
 
@@ -527,22 +529,51 @@ def run_curriculum_training(
     model_cfg = cfg.get("model", {})
     viz_cfg = train_cfg.get("viz") if isinstance(train_cfg, dict) else None
 
+    trigger_service_rate = float(curriculum_cfg.get(
+        "trigger_service_rate",
+        curriculum_cfg.get("trigger_rho", 0.5),
+    ))
+    service_rate_window_size = int(curriculum_cfg.get(
+        "service_rate_window_size",
+        curriculum_cfg.get("rho_window_size", 5),
+    ))
+    require_service_rate_transition = bool(curriculum_cfg.get(
+        "require_service_rate_transition",
+        curriculum_cfg.get("require_rho_transition", True),
+    ))
+    service_rate_warning_threshold = float(curriculum_cfg.get(
+        "service_rate_warning_threshold",
+        curriculum_cfg.get("rho_warning_threshold", 0.35),
+    ))
+    stage_require_service_rate = dict(curriculum_cfg.get(
+        "stage_require_service_rate",
+        curriculum_cfg.get("stage_require_rho", {}),
+    ))
+    service_rate_gate_source = str(curriculum_cfg.get(
+        "service_rate_gate_source",
+        curriculum_cfg.get("rho_gate_source", "auto"),
+    ))
+    stage_service_rate_gate_source = dict(curriculum_cfg.get(
+        "stage_service_rate_gate_source",
+        curriculum_cfg.get("stage_rho_gate_source", {}),
+    ))
+
     curriculum = CurriculumConfig(
         stages=list(curriculum_cfg.get("stages", ["L0", "L1", "L2", "L3"])),
-        trigger_rho=float(curriculum_cfg.get("trigger_rho", 0.5)),
+        trigger_service_rate=trigger_service_rate,
         gamma=float(curriculum_cfg.get("gamma", 1.0)),
         stage_max_steps=int(curriculum_cfg.get("stage_max_steps", 50_000)),
         stage_min_episodes=int(curriculum_cfg.get("stage_min_episodes", 3)),
-        # Rho-gated transition settings
-        rho_window_size=int(curriculum_cfg.get("rho_window_size", 5)),
-        require_rho_transition=bool(curriculum_cfg.get("require_rho_transition", True)),
+        # Service-rate-gated transition settings
+        service_rate_window_size=service_rate_window_size,
+        require_service_rate_transition=require_service_rate_transition,
         stage_extension_steps=int(curriculum_cfg.get("stage_extension_steps", 30_000)),
         max_stage_extensions=int(curriculum_cfg.get("max_stage_extensions", 2)),
         fail_policy=str(curriculum_cfg.get("fail_policy", "fail_fast")),
-        rho_warning_threshold=float(curriculum_cfg.get("rho_warning_threshold", 0.35)),
-        stage_require_rho=dict(curriculum_cfg.get("stage_require_rho", {})),
-        rho_gate_source=str(curriculum_cfg.get("rho_gate_source", "auto")),
-        stage_rho_gate_source=dict(curriculum_cfg.get("stage_rho_gate_source", {})),
+        service_rate_warning_threshold=service_rate_warning_threshold,
+        stage_require_service_rate=stage_require_service_rate,
+        service_rate_gate_source=service_rate_gate_source,
+        stage_service_rate_gate_source=stage_service_rate_gate_source,
         # Collapse protection
         collapse_drop_delta=float(curriculum_cfg.get("collapse_drop_delta", 0.10)),
         collapse_min_rho=float(curriculum_cfg.get("collapse_min_rho", 0.15)),
@@ -735,8 +766,10 @@ def run_curriculum_training(
 
         episode_count = 0
         latest_rho = 0.0
-        rho_history: List[float] = []  # Track rho for window mean
+        rho_history: List[float] = []  # 保留 rho 作为诊断指标
+        service_rate_history: List[float] = []  # 进入延长轮依据
         eval_rho_history: List[float] = []
+        eval_service_rate_history: List[float] = []
         best_service_rate = -1.0
         best_state_dict: Optional[Dict[str, torch.Tensor]] = None
         trainer: Optional[DQNTrainer] = None
@@ -746,8 +779,9 @@ def run_curriculum_training(
         current_env_cfg: Dict[str, Any] = {}  # Track current env config
 
         def _reset_eval_for_env(env_cfg_for_eval: Dict[str, Any]) -> None:
-            nonlocal eval_checkpointer, eval_rho_history
+            nonlocal eval_checkpointer, eval_rho_history, eval_service_rate_history
             eval_rho_history = []
+            eval_service_rate_history = []
             eval_checkpointer = _build_eval_checkpointer(env_cfg_for_eval)
 
         def _run_eval_if_needed() -> None:
@@ -767,13 +801,14 @@ def run_curriculum_training(
                 log_handle=log_handle,
             )
             eval_rho_history.append(float(eval_result.mean_rho))
+            eval_service_rate_history.append(float(eval_result.mean_service_rate))
 
         def _ensure_eval_sample() -> None:
             if not curriculum.eval_enabled:
                 return
             if eval_checkpointer is None or trainer is None:
                 return
-            if eval_rho_history:
+            if eval_service_rate_history:
                 return
             eval_result = eval_checkpointer.evaluate(
                 model=trainer.model,
@@ -787,29 +822,34 @@ def run_curriculum_training(
                 log_handle=log_handle,
             )
             eval_rho_history.append(float(eval_result.mean_rho))
+            eval_service_rate_history.append(float(eval_result.mean_service_rate))
 
-        def _get_gate_rho(stage_name: str) -> Tuple[float, str]:
-            source = curriculum.stage_rho_gate_source.get(stage_name, curriculum.rho_gate_source)
+        def _get_gate_service_rate(stage_name: str) -> Tuple[float, str]:
+            source = curriculum.stage_service_rate_gate_source.get(stage_name, curriculum.service_rate_gate_source)
             source = str(source).lower()
-            train_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
-            eval_mean = _compute_rho_window_mean(eval_rho_history, curriculum.rho_window_size)
+            train_mean = _compute_service_rate_window_mean(
+                service_rate_history, curriculum.service_rate_window_size
+            )
+            eval_mean = _compute_service_rate_window_mean(
+                eval_service_rate_history, curriculum.service_rate_window_size
+            )
 
             if source == "train":
                 return train_mean, "train"
             if source == "eval":
-                if curriculum.eval_enabled and eval_rho_history:
+                if curriculum.eval_enabled and eval_service_rate_history:
                     return eval_mean, "eval"
                 return train_mean, "train"
             if source == "max":
-                if curriculum.eval_enabled and eval_rho_history:
+                if curriculum.eval_enabled and eval_service_rate_history:
                     return max(train_mean, eval_mean), "max"
                 return train_mean, "train"
-            if curriculum.eval_enabled and eval_rho_history:
+            if curriculum.eval_enabled and eval_service_rate_history:
                 return eval_mean, "eval"
             return train_mean, "train"
 
         def _on_episode_end(ep_log: Dict[str, float]) -> bool:
-            nonlocal episode_count, latest_rho, rho_history, best_service_rate, best_state_dict, trainer, current_phase
+            nonlocal episode_count, latest_rho, rho_history, service_rate_history, best_service_rate, best_state_dict, trainer, current_phase
             episode_count += 1
             
             # Compute metrics
@@ -817,9 +857,12 @@ def run_curriculum_training(
             rho = _compute_rho(ep_log, curriculum.gamma)
             latest_rho = rho
             rho_history.append(rho)
+            service_rate_history.append(float(service_rate))
             
             # Compute window mean for transition decision
-            rho_window_mean = _compute_rho_window_mean(rho_history, curriculum.rho_window_size)
+            service_rate_window_mean = _compute_service_rate_window_mean(
+                service_rate_history, curriculum.service_rate_window_size
+            )
             
             # Enhanced logging with global_step and phase info
             record = {
@@ -832,8 +875,8 @@ def run_curriculum_training(
                 "service_rate": float(service_rate),
                 "stuckness": float(ep_log.get("stuckness", 0.0)),
                 "rho": float(rho),
-                "rho_window_mean": float(rho_window_mean),
-                "trigger_rho": float(curriculum.trigger_rho),
+                "service_rate_window_mean": float(service_rate_window_mean),
+                "trigger_service_rate": float(curriculum.trigger_service_rate),
                 "env_cfg_hash": compute_env_cfg_hash(current_env_cfg) if current_env_cfg else "",
                 "replay_size": trainer.buffer.size if trainer else 0,
                 "episode_log": ep_log,
@@ -854,14 +897,18 @@ def run_curriculum_training(
                 trainer.save_model(best_model_path)
             
             # Warning if approaching max_steps with low rho
-            if rho_window_mean < curriculum.rho_warning_threshold:
-                LOG.warning("Stage %s rho_window_mean=%.3f < warning_threshold=%.3f",
-                           spec.name, rho_window_mean, curriculum.rho_warning_threshold)
+            if service_rate_window_mean < curriculum.service_rate_warning_threshold:
+                LOG.warning(
+                    "Stage %s service_rate_window_mean=%.3f < warning_threshold=%.3f",
+                    spec.name,
+                    service_rate_window_mean,
+                    curriculum.service_rate_warning_threshold,
+                )
             
-            # Transition check: use rho_window_mean (not single rho)
+            # Transition check: use service_rate_window_mean (not single episode)
             if episode_count < curriculum.stage_min_episodes:
                 return False
-            return rho_window_mean >= curriculum.trigger_rho
+            return service_rate_window_mean >= curriculum.trigger_service_rate
 
         def _apply_stage_epsilon_schedule(
             trainer: DQNTrainer,
@@ -1052,39 +1099,39 @@ def run_curriculum_training(
                     step_callback=_on_phase3_step,
                 )
             
-            # L3 Extension loop: check rho after all phases complete
+            # L3 Extension loop: check service_rate after all phases complete
             extension_count = 0
             stage_passed = False
             forced_transition = False
-            require_rho_transition = bool(
-                curriculum.stage_require_rho.get(spec.name, curriculum.require_rho_transition)
+            require_service_rate_transition = bool(
+                curriculum.stage_require_service_rate.get(spec.name, curriculum.require_service_rate_transition)
             )
             
             while not stage_passed:
                 _ensure_eval_sample()
-                rho_window_mean, rho_source = _get_gate_rho(spec.name)
+                service_rate_window_mean, service_rate_source = _get_gate_service_rate(spec.name)
                 
                 if (
-                    (len(eval_rho_history) if rho_source == "eval" else len(rho_history))
+                    (len(eval_service_rate_history) if service_rate_source == "eval" else len(service_rate_history))
                     >= curriculum.stage_min_episodes
-                    and rho_window_mean >= curriculum.trigger_rho
+                    and service_rate_window_mean >= curriculum.trigger_service_rate
                 ):
                     LOG.info(
-                        "Stage L3 PASSED: rho_window_mean=%.4f >= trigger=%.4f (source=%s)",
-                        rho_window_mean,
-                        curriculum.trigger_rho,
-                        rho_source,
+                        "Stage L3 PASSED: service_rate_window_mean=%.4f >= trigger=%.4f (source=%s)",
+                        service_rate_window_mean,
+                        curriculum.trigger_service_rate,
+                        service_rate_source,
                     )
                     stage_passed = True
                     break
                 
                 # Not passed - check if we should extend or fail
-                if not require_rho_transition:
+                if not require_service_rate_transition:
                     LOG.warning(
-                        "Stage L3 FORCED transition: rho_window_mean=%.4f < trigger=%.4f (source=%s)",
-                        rho_window_mean,
-                        curriculum.trigger_rho,
-                        rho_source,
+                        "Stage L3 FORCED transition: service_rate_window_mean=%.4f < trigger=%.4f (source=%s)",
+                        service_rate_window_mean,
+                        curriculum.trigger_service_rate,
+                        service_rate_source,
                     )
                     forced_transition = True
                     stage_passed = True
@@ -1094,22 +1141,22 @@ def run_curriculum_training(
                 if extension_count > curriculum.max_stage_extensions:
                     if curriculum.fail_policy == "fail_fast":
                         LOG.error(
-                            "Stage L3 FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions (source=%s)",
-                            rho_window_mean,
-                            curriculum.trigger_rho,
+                            "Stage L3 FAILED: service_rate_window_mean=%.4f < trigger=%.4f after %d extensions (source=%s)",
+                            service_rate_window_mean,
+                            curriculum.trigger_service_rate,
                             extension_count - 1,
-                            rho_source,
+                            service_rate_source,
                         )
                         log_handle.write(json.dumps({
                             "type": "stage_failed",
                             "stage": "L3",
-                            "rho_window_mean": float(rho_window_mean),
-                            "trigger_rho": float(curriculum.trigger_rho),
-                            "rho_source": rho_source,
+                            "service_rate_window_mean": float(service_rate_window_mean),
+                            "trigger_service_rate": float(curriculum.trigger_service_rate),
+                            "service_rate_source": service_rate_source,
                             "extensions": extension_count - 1,
                         }, ensure_ascii=False) + "\n")
                         log_handle.flush()
-                        raise StageFailedError("L3", rho_window_mean, curriculum.trigger_rho)
+                        raise StageFailedError("L3", service_rate_window_mean, curriculum.trigger_service_rate)
                     else:
                         LOG.warning("Stage L3 FORCED transition after max extensions")
                         forced_transition = True
@@ -1118,19 +1165,19 @@ def run_curriculum_training(
                 
                 # Log and run extension
                 LOG.warning(
-                    "Stage L3 extension %d/%d: rho_window_mean=%.4f < trigger=%.4f (source=%s)",
+                    "Stage L3 extension %d/%d: service_rate_window_mean=%.4f < trigger=%.4f (source=%s)",
                     extension_count,
                     curriculum.max_stage_extensions,
-                    rho_window_mean,
-                    curriculum.trigger_rho,
-                    rho_source,
+                    service_rate_window_mean,
+                    curriculum.trigger_service_rate,
+                    service_rate_source,
                 )
                 log_handle.write(json.dumps({
                     "type": "stage_extension",
                     "stage": "L3",
                     "extension": extension_count,
-                    "rho_window_mean": float(rho_window_mean),
-                    "rho_source": rho_source,
+                    "service_rate_window_mean": float(service_rate_window_mean),
+                    "service_rate_source": service_rate_source,
                     "additional_steps": curriculum.stage_extension_steps,
                 }, ensure_ascii=False) + "\n")
                 log_handle.flush()
@@ -1163,13 +1210,13 @@ def run_curriculum_training(
             _reset_eval_for_env(stage_env_cfg)
             _apply_stage_epsilon_schedule(trainer, spec.name, stage_budget)
             
-            # Extension loop for rho-gated transitions
+            # Extension loop for service-rate-gated transitions
             extension_count = 0
             current_budget = int(stage_budget)
             stage_passed = False
             forced_transition = False
-            require_rho_transition = bool(
-                curriculum.stage_require_rho.get(spec.name, curriculum.require_rho_transition)
+            require_service_rate_transition = bool(
+                curriculum.stage_require_service_rate.get(spec.name, curriculum.require_service_rate_transition)
             )
             
             while not stage_passed:
@@ -1177,31 +1224,31 @@ def run_curriculum_training(
                 trainer.train(total_steps=current_budget, episode_callback=_on_episode_end)
                 
                 _ensure_eval_sample()
-                rho_window_mean, rho_source = _get_gate_rho(spec.name)
+                service_rate_window_mean, service_rate_source = _get_gate_service_rate(spec.name)
                 
                 if (
-                    (len(eval_rho_history) if rho_source == "eval" else len(rho_history))
+                    (len(eval_service_rate_history) if service_rate_source == "eval" else len(service_rate_history))
                     >= curriculum.stage_min_episodes
-                    and rho_window_mean >= curriculum.trigger_rho
+                    and service_rate_window_mean >= curriculum.trigger_service_rate
                 ):
                     LOG.info(
-                        "Stage %s PASSED: rho_window_mean=%.4f >= trigger=%.4f (source=%s)",
+                        "Stage %s PASSED: service_rate_window_mean=%.4f >= trigger=%.4f (source=%s)",
                         spec.name,
-                        rho_window_mean,
-                        curriculum.trigger_rho,
-                        rho_source,
+                        service_rate_window_mean,
+                        curriculum.trigger_service_rate,
+                        service_rate_source,
                     )
                     stage_passed = True
                     break
                 
                 # Not passed - check if we should extend or fail
-                if not require_rho_transition:
+                if not require_service_rate_transition:
                     LOG.warning(
-                        "Stage %s FORCED transition: rho_window_mean=%.4f < trigger=%.4f (source=%s, require_rho_transition=False)",
+                        "Stage %s FORCED transition: service_rate_window_mean=%.4f < trigger=%.4f (source=%s, require_service_rate_transition=False)",
                         spec.name,
-                        rho_window_mean,
-                        curriculum.trigger_rho,
-                        rho_source,
+                        service_rate_window_mean,
+                        curriculum.trigger_service_rate,
+                        service_rate_source,
                     )
                     forced_transition = True
                     stage_passed = True
@@ -1211,42 +1258,46 @@ def run_curriculum_training(
                 if extension_count > curriculum.max_stage_extensions:
                     if curriculum.fail_policy == "fail_fast":
                         LOG.error(
-                            "Stage %s FAILED: rho_window_mean=%.4f < trigger=%.4f after %d extensions (source=%s)",
+                            "Stage %s FAILED: service_rate_window_mean=%.4f < trigger=%.4f after %d extensions (source=%s)",
                             spec.name,
-                            rho_window_mean,
-                            curriculum.trigger_rho,
+                            service_rate_window_mean,
+                            curriculum.trigger_service_rate,
                             extension_count - 1,
-                            rho_source,
+                            service_rate_source,
                         )
                         # Log failure event
                         log_handle.write(json.dumps({
                             "type": "stage_failed",
                             "stage": spec.name,
-                            "rho_window_mean": float(rho_window_mean),
-                            "trigger_rho": float(curriculum.trigger_rho),
-                            "rho_source": rho_source,
+                            "service_rate_window_mean": float(service_rate_window_mean),
+                            "trigger_service_rate": float(curriculum.trigger_service_rate),
+                            "service_rate_source": service_rate_source,
                             "extensions": extension_count - 1,
                             "fail_policy": curriculum.fail_policy,
                         }, ensure_ascii=False) + "\n")
                         log_handle.flush()
-                        raise StageFailedError(spec.name, rho_window_mean, curriculum.trigger_rho)
+                        raise StageFailedError(spec.name, service_rate_window_mean, curriculum.trigger_service_rate)
                     else:
                         # forced policy
-                        LOG.warning("Stage %s FORCED transition after max extensions: rho_window_mean=%.4f < trigger=%.4f",
-                                   spec.name, rho_window_mean, curriculum.trigger_rho)
+                        LOG.warning(
+                            "Stage %s FORCED transition after max extensions: service_rate_window_mean=%.4f < trigger=%.4f",
+                            spec.name,
+                            service_rate_window_mean,
+                            curriculum.trigger_service_rate,
+                        )
                         forced_transition = True
                         stage_passed = True
                         break
                 
                 # Log extension
                 LOG.warning(
-                    "Stage %s extension %d/%d: rho_window_mean=%.4f < trigger=%.4f (source=%s), adding %d steps",
+                    "Stage %s extension %d/%d: service_rate_window_mean=%.4f < trigger=%.4f (source=%s), adding %d steps",
                     spec.name,
                     extension_count,
                     curriculum.max_stage_extensions,
-                    rho_window_mean,
-                    curriculum.trigger_rho,
-                    rho_source,
+                    service_rate_window_mean,
+                    curriculum.trigger_service_rate,
+                    service_rate_source,
                     curriculum.stage_extension_steps,
                 )
                 log_handle.write(json.dumps({
@@ -1254,9 +1305,9 @@ def run_curriculum_training(
                     "stage": spec.name,
                     "extension": extension_count,
                     "max_extensions": curriculum.max_stage_extensions,
-                    "rho_window_mean": float(rho_window_mean),
-                    "trigger_rho": float(curriculum.trigger_rho),
-                    "rho_source": rho_source,
+                    "service_rate_window_mean": float(service_rate_window_mean),
+                    "trigger_service_rate": float(curriculum.trigger_service_rate),
+                    "service_rate_source": service_rate_source,
                     "additional_steps": curriculum.stage_extension_steps,
                 }, ensure_ascii=False) + "\n")
                 log_handle.flush()
@@ -1274,9 +1325,9 @@ def run_curriculum_training(
             model_path_latest=(stage_dir / "edgeq_model_latest.pt") if (stage_dir / "edgeq_model_latest.pt").exists() else None,
             extra={"stage": spec.name, "stage_dir": str(stage_dir)},
         )
-        # Compute final rho_window_mean for transition log
+        # Compute final service_rate_window_mean for transition log
         _ensure_eval_sample()
-        final_rho_window_mean, final_rho_source = _get_gate_rho(spec.name)
+        final_service_rate_window_mean, final_service_rate_source = _get_gate_service_rate(spec.name)
         transition = {
             "type": "stage_transition",
             "from_stage": spec.name,
@@ -1284,10 +1335,10 @@ def run_curriculum_training(
             "stage_index": int(current_stage_idx),
             "episodes": int(episode_count),
             "last_rho": float(latest_rho),
-            "rho_window_mean": float(final_rho_window_mean),
-            "trigger_rho": float(curriculum.trigger_rho),
-            "rho_source": final_rho_source,
-            "passed": final_rho_window_mean >= curriculum.trigger_rho,
+            "service_rate_window_mean": float(final_service_rate_window_mean),
+            "trigger_service_rate": float(curriculum.trigger_service_rate),
+            "service_rate_source": final_service_rate_source,
+            "passed": final_service_rate_window_mean >= curriculum.trigger_service_rate,
             "forced_transition": 'forced_transition' in dir() and forced_transition,
         }
         log_handle.write(json.dumps(transition, ensure_ascii=False) + "\n")

@@ -1103,11 +1103,24 @@ class EventDrivenEnv:
             return [], []
 
         actions = [dst for dst, _ in candidates]
+        dropoff_stops = {int(pax["dropoff_stop_id"]) for pax in vehicle.onboard}
+        has_onboard = len(vehicle.onboard) > 0
+        is_full = len(vehicle.onboard) >= int(self.config.vehicle_capacity)
+        has_dropoff_candidate = any(int(dst) in dropoff_stops for dst, _ in candidates)
         mask = []
         debug_entries = []
         for dst, travel in candidates:
             feasible = True
             violations = []
+            if is_full and has_dropoff_candidate and int(dst) not in dropoff_stops:
+                feasible = False
+                violations.append(
+                    {
+                        "type": "onboard_priority_full",
+                        "vehicle_id": int(vehicle.vehicle_id),
+                        "dropoff_count": int(len(dropoff_stops)),
+                    }
+                )
             dropoffs_at_dst = sum(1 for pax in vehicle.onboard if pax["dropoff_stop_id"] == dst)
             projected_onboard = len(vehicle.onboard) - dropoffs_at_dst
             capacity_left = self.config.vehicle_capacity - projected_onboard

@@ -75,10 +75,18 @@ def test_mask_debug_entries_deterministic(tmp_path: Path):
     )
     _set_violating_onboard(env1)
     actions, mask = env1.get_action_mask(debug=True)
-    assert actions == [1]
-    assert mask == [False]
+    assert actions == [1, 0]
+    assert mask == [False, True]
     assert env1.last_mask_debug
-    entry = env1.last_mask_debug[0]["violations"][0]
+    entry = None
+    for debug_entry in env1.last_mask_debug:
+        for violation in debug_entry.get("violations", []):
+            if violation.get("type") == "hard_mask":
+                entry = violation
+                break
+        if entry is not None:
+            break
+    assert entry is not None
     assert entry["type"] == "hard_mask"
     assert entry["request_id"] == 99
     assert entry["dropoff_stop_id"] == 1
@@ -97,7 +105,14 @@ def test_mask_debug_entries_deterministic(tmp_path: Path):
     )
     _set_violating_onboard(env2)
     env2.get_action_mask(debug=True)
-    entry2 = env2.last_mask_debug[0]["violations"][0]
+    entry2 = None
+    for debug_entry in env2.last_mask_debug:
+        for violation in debug_entry.get("violations", []):
+            if violation.get("type") == "hard_mask":
+                entry2 = violation
+                break
+        if entry2 is not None:
+            break
     assert entry2 == entry
 
 

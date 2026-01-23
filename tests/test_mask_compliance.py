@@ -72,5 +72,5 @@ def test_mask_blocks_over_budget(tmp_path: Path):
     ]
 
     actions, mask = env.get_action_mask()
-    assert actions == [1]
-    assert mask == [False]
+    assert actions == [1, 0]
+    assert mask == [False, True]
