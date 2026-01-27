@@ -75,6 +75,38 @@ class CurriculumConfig:
     reward_ramp_steps: int = 10000
     ramp_fields: List[str] = field(default_factory=lambda: DEFAULT_RAMP_FIELDS.copy())
 
+    @property
+    def trigger_rho(self) -> float:
+        return float(self.trigger_service_rate)
+
+    @trigger_rho.setter
+    def trigger_rho(self, value: float) -> None:
+        self.trigger_service_rate = float(value)
+
+    @property
+    def rho_warning_threshold(self) -> float:
+        return float(self.service_rate_warning_threshold)
+
+    @rho_warning_threshold.setter
+    def rho_warning_threshold(self, value: float) -> None:
+        self.service_rate_warning_threshold = float(value)
+
+    @property
+    def rho_window_size(self) -> int:
+        return int(self.service_rate_window_size)
+
+    @rho_window_size.setter
+    def rho_window_size(self, value: int) -> None:
+        self.service_rate_window_size = int(value)
+
+    @property
+    def require_rho_transition(self) -> bool:
+        return bool(self.require_service_rate_transition)
+
+    @require_rho_transition.setter
+    def require_rho_transition(self, value: bool) -> None:
+        self.require_service_rate_transition = bool(value)
+
 
 def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
     return EnvConfig(
@@ -143,6 +175,8 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         fleet_potential_hybrid_neighbor_weight=float(env_cfg.get("fleet_potential_hybrid_neighbor_weight", 0.5)),
         fleet_potential_phi=str(env_cfg.get("fleet_potential_phi", "log1p_norm")),
         reward_terminal_backlog_penalty=float(env_cfg.get("reward_terminal_backlog_penalty", 0.0)),
+        hard_mask_skip_unrecoverable=bool(env_cfg.get("hard_mask_skip_unrecoverable", False)),
+        hard_mask_slack_sec=float(env_cfg.get("hard_mask_slack_sec", 0.0)),
     )
 
 
@@ -279,6 +313,16 @@ def _compute_service_rate_window_mean(service_rate_history: List[float], window_
     if not service_rate_history:
         return 0.0
     window = service_rate_history[-window_size:]
+    return float(np.mean(window))
+
+
+def _compute_rho_window_mean(rho_history: List[float], window_size: int) -> float:
+    """Compute mean rho over the last window_size episodes."""
+    if not rho_history:
+        return 0.0
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+    window = rho_history[-int(window_size):]
     return float(np.mean(window))
 
 

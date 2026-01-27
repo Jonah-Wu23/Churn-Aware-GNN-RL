@@ -81,14 +81,15 @@ def build_env_config(config: Dict[str, Any], seed: int) -> EnvConfig:
     """Build EnvConfig from YAML config with training split."""
     env_cfg = config.get("env", {})
     paths_cfg = config.get("paths", {})
-    
+    wu2024_cfg = config.get("wu2024_train", {})
+     
     return EnvConfig(
         max_horizon_steps=int(env_cfg.get("max_horizon_steps", 2000)),
         mask_alpha=float(env_cfg.get("mask_alpha", 1.5)),
         walk_threshold_sec=int(env_cfg.get("walk_threshold_sec", 600)),
         max_requests=int(env_cfg.get("max_requests", 1500)),
         seed=seed,
-        num_vehicles=int(env_cfg.get("num_vehicles", 51)),
+        num_vehicles=int(wu2024_cfg.get("num_vehicles", env_cfg.get("num_vehicles", 51))),
         vehicle_capacity=int(env_cfg.get("vehicle_capacity", 6)),
         request_timeout_sec=int(env_cfg.get("request_timeout_sec", 600)),
         debug_mask=bool(env_cfg.get("debug_mask", False)),

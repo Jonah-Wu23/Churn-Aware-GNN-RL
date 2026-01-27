@@ -98,6 +98,7 @@ class EvaluationCheckpointer:
         self.best_model_state: Optional[Dict[str, torch.Tensor]] = None
         self.history: List[EvalResult] = []
         self.collapse_counter: int = 0
+        self._last_eval_global_step: int = 0
     
     def _run_greedy_episode(self, model: nn.Module, env) -> Dict[str, float]:
         """Run a single episode with epsilon=0 (greedy).
@@ -213,6 +214,7 @@ class EvaluationCheckpointer:
         Returns:
             EvalResult with evaluation metrics
         """
+        self._last_eval_global_step = int(global_step)
         per_seed: List[Dict[str, float]] = []
         
         for seed in self.config.eval_seeds:
@@ -311,7 +313,11 @@ class EvaluationCheckpointer:
     
     def should_evaluate(self, global_step: int) -> bool:
         """Check if evaluation should run at this step."""
-        return global_step > 0 and global_step % self.config.eval_interval_steps == 0
+        interval = int(self.config.eval_interval_steps)
+        if interval <= 0:
+            return False
+        step = int(global_step)
+        return step > 0 and (step - int(self._last_eval_global_step)) >= interval
 
 
 def compute_env_cfg_hash(env_cfg: Dict[str, object]) -> str:

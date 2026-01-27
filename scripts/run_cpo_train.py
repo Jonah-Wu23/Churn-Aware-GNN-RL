@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pickle
 import sys
@@ -30,16 +31,38 @@ import numpy as np
 import torch
 import yaml
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 # Add PyTorch-CPO to path
 PYTORCH_CPO_PATH = PROJECT_ROOT / "baselines" / "PyTorch-CPO"
+if not PYTORCH_CPO_PATH.exists():
+    raise FileNotFoundError(
+        f"Missing PyTorch-CPO baseline at {PYTORCH_CPO_PATH}. "
+        "Upload/clone it to baselines/PyTorch-CPO before running CPO training."
+    )
 sys.path.insert(0, str(PYTORCH_CPO_PATH))
 
 from src.env.cpo_env_wrapper import CPOEnvConfig, CPOEnvWrapper
 from src.env.gym_env import EnvConfig
+
+
+def _select_torch_dtype(device: torch.device, dtype_arg: str) -> torch.dtype:
+    dtype_arg = str(dtype_arg).lower().strip()
+    if dtype_arg == "float32":
+        return torch.float32
+    if dtype_arg == "float64":
+        return torch.float64
+    if dtype_arg != "auto":
+        raise ValueError(f"Invalid dtype: {dtype_arg} (expected auto/float32/float64)")
+    # Keep prior behavior on CPU (float64), but use float32 on CUDA for speed.
+    return torch.float32 if device.type == "cuda" else torch.float64
 
 
 def parse_args():
@@ -47,6 +70,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="CPO training for micro-transit")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML")
     parser.add_argument("--max-iter", type=int, default=500, help="Max training iterations")
+    parser.add_argument(
+        "--target-steps",
+        type=int,
+        default=0,
+        help="Approximate total environment steps; overrides max-iter based on min-batch-size",
+    )
     parser.add_argument("--max-constraint", type=float, default=10.0, help="Cost constraint limit (d_k)")
     parser.add_argument("--max-kl", type=float, default=0.01, help="KL divergence constraint")
     parser.add_argument("--damping", type=float, default=0.1, help="CG damping coefficient")
@@ -57,6 +86,13 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=64, help="Hidden layer size")
     parser.add_argument("--seed", type=int, default=7, help="Random seed")
     parser.add_argument("--gpu-index", type=int, default=0, help="GPU device index")
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "float32", "float64"],
+        help="Torch dtype: auto uses float32 on CUDA and float64 on CPU.",
+    )
     parser.add_argument("--neighbor-k", type=int, default=8, help="Action space size (neighbor stops)")
     parser.add_argument("--run-dir", type=str, default=None, help="Output directory")
     parser.add_argument("--anneal", action="store_true", help="Enable constraint annealing")
@@ -68,6 +104,12 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_max_iter(args) -> int:
+    if args.target_steps and int(args.target_steps) > 0:
+        return int(math.ceil(int(args.target_steps) / max(1, int(args.min_batch_size))))
+    return int(args.max_iter)
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load YAML configuration."""
     with open(config_path, "r", encoding="utf-8") as f:
@@ -77,13 +119,14 @@ def load_config(config_path: str) -> Dict[str, Any]:
 def build_env_config(config: Dict[str, Any], seed: int) -> EnvConfig:
     """Build EnvConfig from YAML config."""
     env_cfg = config.get("env", {})
+    cpo_cfg = config.get("cpo_train", {})
     return EnvConfig(
         max_horizon_steps=int(env_cfg.get("max_horizon_steps", 200)),
         mask_alpha=float(env_cfg.get("mask_alpha", 1.5)),
         walk_threshold_sec=int(env_cfg.get("walk_threshold_sec", 600)),
         max_requests=int(env_cfg.get("max_requests", 2000)),
         seed=seed,
-        num_vehicles=int(env_cfg.get("num_vehicles", 1)),
+        num_vehicles=int(cpo_cfg.get("num_vehicles", env_cfg.get("num_vehicles", 1))),
         vehicle_capacity=int(env_cfg.get("vehicle_capacity", 6)),
         request_timeout_sec=int(env_cfg.get("request_timeout_sec", 600)),
         churn_tol_sec=int(env_cfg.get("churn_tol_sec", 300)),
@@ -141,19 +184,30 @@ def main():
     
     print(f"[CPO Train] Output directory: {run_dir}")
     print(f"[CPO Train] Config: {args.config}")
-    print(f"[CPO Train] Max iterations: {args.max_iter}")
+    resolved_max_iter = _resolve_max_iter(args)
+    print(f"[CPO Train] Max iterations: {resolved_max_iter}")
+    if args.target_steps and int(args.target_steps) > 0:
+        approx_steps = resolved_max_iter * int(args.min_batch_size)
+        print(f"[CPO Train] Target steps: {args.target_steps} (approx {approx_steps} steps)")
     print(f"[CPO Train] Cost limit (d_k): {args.max_constraint}")
     print(f"[CPO Train] Line search enabled: {args.enable_line_search}")
     
     # Setup device
-    dtype = torch.float64
-    torch.set_default_dtype(dtype)
-    device = torch.device("cuda", index=args.gpu_index) if torch.cuda.is_available() else torch.device("cpu")
     if torch.cuda.is_available():
+        if args.gpu_index < 0 or args.gpu_index >= torch.cuda.device_count():
+            raise ValueError(
+                f"Invalid --gpu-index {args.gpu_index}; available cuda devices: {torch.cuda.device_count()}"
+            )
+        device = torch.device("cuda", index=args.gpu_index)
         print(f"[CPO Train] Using GPU: {args.gpu_index}")
         torch.cuda.set_device(args.gpu_index)
     else:
+        device = torch.device("cpu")
         print("[CPO Train] Using CPU")
+
+    dtype = _select_torch_dtype(device, args.dtype)
+    torch.set_default_dtype(dtype)
+    print(f"[CPO Train] Torch dtype: {dtype}")
     
     # Seeding
     np.random.seed(args.seed)
@@ -216,9 +270,11 @@ def main():
     best_avg_reward = -float("inf")
     training_log = []
     
-    print(f"\n[CPO Train] Starting training for {args.max_iter} iterations...")
+    print(f"\n[CPO Train] Starting training for {resolved_max_iter} iterations...")
     
-    for i_iter in range(args.max_iter):
+    iter_range = range(resolved_max_iter)
+    progress = tqdm(iter_range, dynamic_ncols=True, desc="CPO", unit="iter") if tqdm is not None else iter_range
+    for i_iter in progress:
         # Collect samples
         batch, log = agent.collect_samples(args.min_batch_size)
         
@@ -286,17 +342,32 @@ def main():
         training_log.append(iter_log)
         
         if i_iter % args.log_interval == 0:
-            print(f"[Iter {i_iter:4d}] R_avg: {log['env_avg_reward']:8.2f} | "
-                  f"Steps: {log['num_steps']:5d} | "
-                  f"V_loss: {iter_log['v_loss']:.4f} | "
-                  f"d_k: {d_k:.2f}")
+            msg = (
+                f"[Iter {i_iter:4d}] R_avg: {log['env_avg_reward']:8.2f} | "
+                f"Steps: {log['num_steps']:5d} | "
+                f"V_loss: {iter_log['v_loss']:.4f} | "
+                f"d_k: {d_k:.2f}"
+            )
+            if tqdm is not None and hasattr(progress, "write"):
+                progress.write(msg)
+            else:
+                print(msg)
+
+        if tqdm is not None and hasattr(progress, "set_postfix"):
+            progress.set_postfix(
+                r_avg=f"{log['env_avg_reward']:.2f}",
+                steps=int(log["num_steps"]),
+                d_k=f"{d_k:.2f}",
+                refresh=False,
+            )
         
         # Save best model
         if log["env_avg_reward"] > best_avg_reward:
             best_avg_reward = log["env_avg_reward"]
             to_device(torch.device("cpu"), policy_net, value_net)
             save_path = run_dir / "best_model.pkl"
-            pickle.dump((policy_net, value_net, running_state), open(save_path, "wb"))
+            with open(save_path, "wb") as f:
+                pickle.dump((policy_net, value_net, running_state), f)
             to_device(device, policy_net, value_net)
             print(f"  [New best] R_avg={best_avg_reward:.2f} saved to {save_path}")
         
@@ -304,12 +375,14 @@ def main():
         if (i_iter + 1) % args.save_interval == 0:
             to_device(torch.device("cpu"), policy_net, value_net)
             save_path = run_dir / f"checkpoint_{i_iter + 1}.pkl"
-            pickle.dump((policy_net, value_net, running_state), open(save_path, "wb"))
+            with open(save_path, "wb") as f:
+                pickle.dump((policy_net, value_net, running_state), f)
             to_device(device, policy_net, value_net)
     
     # Save final model
     to_device(torch.device("cpu"), policy_net, value_net)
-    pickle.dump((policy_net, value_net, running_state), open(run_dir / "final_model.pkl", "wb"))
+    with open(run_dir / "final_model.pkl", "wb") as f:
+        pickle.dump((policy_net, value_net, running_state), f)
     
     # Save training log
     with open(run_dir / "training_log.json", "w", encoding="utf-8") as f:

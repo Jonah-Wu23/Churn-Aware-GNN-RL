@@ -15,6 +15,13 @@ import networkx as nx
 import pandas as pd
 
 from src.utils.fairness import gini_coefficient, compute_service_volume_gini
+from src.utils.hard_mask import (
+    DEFAULT_MAX_TIME_SEC,
+    HardMaskGate,
+    compute_hard_mask_gate,
+    hard_deadline_over_by_sec,
+    sanitize_time_sec,
+)
 
 
 def _haversine_meters(lon1: np.ndarray, lat1: np.ndarray, lon2: np.ndarray, lat2: np.ndarray) -> np.ndarray:
@@ -87,6 +94,7 @@ class EnvConfig:
     debug_abort_on_alert: bool = True
     debug_dump_dir: str = "reports/debug/potential_alerts"
     demand_exhausted_min_time_sec: float = 300.0  # Grace period before demand-exhausted termination
+    allow_demand_exhausted_termination: bool = True
     cvar_alpha: float = 0.95
     fairness_gamma: float = 1.0
     travel_time_multiplier: float = 1.0
@@ -105,6 +113,9 @@ class EnvConfig:
     fleet_potential_hybrid_center_weight: float = 0.5
     fleet_potential_hybrid_neighbor_weight: float = 0.5
     fleet_potential_phi: str = "log1p_norm"  # Options: "log1p_norm", "linear_norm"
+    # Hard-mask robustness: avoid action-space collapse when deadlines are already missed.
+    hard_mask_skip_unrecoverable: bool = False
+    hard_mask_slack_sec: float = 0.0
 
     def __post_init__(self) -> None:
         if self.reward_churn_penalty is not None:
@@ -131,6 +142,8 @@ class EnvConfig:
             raise ValueError("reward_tacc_transform_scale must be positive for log1p")
         if self.reward_potential_lost_weight < 0:
             raise ValueError("reward_potential_lost_weight must be >= 0")
+        if self.hard_mask_slack_sec < 0:
+            raise ValueError("hard_mask_slack_sec must be >= 0")
 
 
 @dataclass
@@ -997,6 +1010,10 @@ class EventDrivenEnv:
         # If there are already ready vehicles queued (e.g., multiple arrivals at the same sim_time),
         # we must pick one immediately. Otherwise the simulator can "stall" at a fixed time while
         # the trainer keeps issuing actions, producing 0 served/churn and flat metrics.
+        if self.config.max_sim_time_sec is not None and self.current_time >= float(self.config.max_sim_time_sec):
+            self.current_time = float(self.config.max_sim_time_sec)
+            self.done = True
+            return
         if self.active_vehicle_id is None and self.ready_vehicle_ids:
             self.active_vehicle_id = self.ready_vehicle_ids.pop(0)
             return
@@ -1005,6 +1022,10 @@ class EventDrivenEnv:
                 self.done = True
                 return
             next_time = self.event_queue[0][0]
+            if self.config.max_sim_time_sec is not None and float(next_time) >= float(self.config.max_sim_time_sec):
+                self.current_time = float(self.config.max_sim_time_sec)
+                self.done = True
+                return
             self.current_time = float(next_time)
             events_at_time: List[Tuple[float, int, int, str, dict]] = []
             while self.event_queue and self.event_queue[0][0] == next_time:
@@ -1109,6 +1130,36 @@ class EventDrivenEnv:
         has_dropoff_candidate = any(int(dst) in dropoff_stops for dst, _ in candidates)
         mask = []
         debug_entries = []
+        hard_mask_slack_sec = float(getattr(self.config, "hard_mask_slack_sec", 0.0))
+        hard_mask_skip_unrecoverable = bool(getattr(self.config, "hard_mask_skip_unrecoverable", False))
+        hard_mask_skipped = []
+        hard_mask_gate_by_id: Dict[int, HardMaskGate] = {}
+        if has_onboard:
+            for pax in vehicle.onboard:
+                pickup_time_sec = pax.get("pickup_time_sec")
+                t_max_sec = pax.get("t_max_sec")
+                dropoff_stop_id = pax.get("dropoff_stop_id")
+                if dropoff_stop_id is None:
+                    continue
+                gate = compute_hard_mask_gate(
+                    pickup_time_sec=pickup_time_sec,
+                    t_max_sec=t_max_sec,
+                    current_time_sec=float(self.current_time),
+                    best_remaining_sec=self._shortest_time(vehicle.current_stop, int(dropoff_stop_id)),
+                    slack_sec=hard_mask_slack_sec,
+                    max_time_sec=DEFAULT_MAX_TIME_SEC,
+                    skip_unrecoverable=hard_mask_skip_unrecoverable,
+                )
+                hard_mask_gate_by_id[id(pax)] = gate
+                if not gate.enforce:
+                    hard_mask_skipped.append(
+                        {
+                            "request_id": pax.get("request_id"),
+                            "dropoff_stop_id": int(dropoff_stop_id),
+                            "baseline_eta_sec": float(gate.baseline_eta_sec),
+                            "baseline_over_by_sec": float(gate.baseline_over_by_sec),
+                        }
+                    )
         for dst, travel in candidates:
             feasible = True
             violations = []
@@ -1137,10 +1188,20 @@ class EventDrivenEnv:
                     }
                 )
             for pax in vehicle.onboard:
-                remaining = self._shortest_time(dst, pax["dropoff_stop_id"])
-                eta_total = self.current_time + travel + remaining
-                over_by = eta_total - pax["pickup_time_sec"] - pax["t_max_sec"]
-                if over_by > 0:
+                gate = hard_mask_gate_by_id.get(id(pax))
+                if gate is not None and not gate.enforce:
+                    continue
+                remaining = sanitize_time_sec(
+                    self._shortest_time(dst, pax["dropoff_stop_id"]),
+                    max_time_sec=DEFAULT_MAX_TIME_SEC,
+                )
+                eta_total = float(self.current_time) + float(travel) + float(remaining)
+                pickup_time_sec = pax.get("pickup_time_sec")
+                t_max_sec = pax.get("t_max_sec")
+                if pickup_time_sec is None or t_max_sec is None:
+                    continue
+                over_by = hard_deadline_over_by_sec(eta_total, float(pickup_time_sec), float(t_max_sec))
+                if over_by > hard_mask_slack_sec:
                     feasible = False
                     violations.append(
                         {
@@ -1164,6 +1225,16 @@ class EventDrivenEnv:
                         "violations": violations,
                     }
                 )
+        if hard_mask_skip_unrecoverable and hard_mask_skipped and (debug or self.config.debug_mask):
+            debug_entries.insert(
+                0,
+                {
+                    "type": "hard_mask_skip_unrecoverable",
+                    "vehicle_id": int(vehicle.vehicle_id),
+                    "slack_sec": hard_mask_slack_sec,
+                    "skipped": hard_mask_skipped,
+                },
+            )
         if not self.config.allow_stop_when_actions_exist:
             stop_indices = [idx for idx, dst in enumerate(actions) if int(dst) == int(vehicle.current_stop)]
             if stop_indices:
@@ -1375,6 +1446,8 @@ class EventDrivenEnv:
         waiting_churned_before = before_snapshot["waiting_churned"]
         onboard_churned_before = before_snapshot["onboard_churned"]
         structural_before = before_snapshot["structural_unserviceable"]
+        if self.config.max_sim_time_sec is not None and self.current_time > float(self.config.max_sim_time_sec):
+            self.current_time = float(self.config.max_sim_time_sec)
         if self.config.max_sim_time_sec is not None and self.current_time >= float(self.config.max_sim_time_sec):
             self.done = True
             after_snapshot = self._snapshot_potential()
@@ -1427,7 +1500,8 @@ class EventDrivenEnv:
             }
             return self._observe(), 0.0, True, info
         if (
-            self.current_time >= float(self.config.demand_exhausted_min_time_sec)
+            self.config.allow_demand_exhausted_termination
+            and self.current_time >= float(self.config.demand_exhausted_min_time_sec)
             and self._no_pending_requests()
             and not self._has_future_orders()
         ):
@@ -1593,6 +1667,18 @@ class EventDrivenEnv:
                 raise ValueError("Missing travel time for action")
 
         arrival_time = self.current_time + travel_time
+        if self.config.max_sim_time_sec is not None and arrival_time >= float(self.config.max_sim_time_sec):
+            self.current_time = float(self.config.max_sim_time_sec)
+            self.done = True
+            after_snapshot = self._snapshot_potential()
+            waiting_remaining = after_snapshot["waiting_remaining"]
+            onboard_remaining = after_snapshot["onboard_remaining"]
+            info = {
+                "done_reason": "max_sim_time",
+                "waiting_remaining": waiting_remaining,
+                "onboard_remaining": onboard_remaining,
+            }
+            return self._observe(), 0.0, True, info
         self._log_event(
             self.current_time,
             EVENT_VEHICLE_DEPARTURE,

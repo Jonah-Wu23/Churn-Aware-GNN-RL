@@ -81,14 +81,15 @@ def build_env_config(config: Dict[str, Any], seed: int) -> EnvConfig:
     """Build EnvConfig from YAML config with training split."""
     env_cfg = config.get("env", {})
     paths_cfg = config.get("paths", {})
-    
+    mohito_cfg = config.get("mohito_train", {})
+     
     return EnvConfig(
         max_horizon_steps=int(env_cfg.get("max_horizon_steps", 2000)),
         mask_alpha=float(env_cfg.get("mask_alpha", 1.5)),
         walk_threshold_sec=int(env_cfg.get("walk_threshold_sec", 600)),
         max_requests=int(env_cfg.get("max_requests", 1500)),
         seed=seed,
-        num_vehicles=int(env_cfg.get("num_vehicles", 51)),
+        num_vehicles=int(mohito_cfg.get("num_vehicles", env_cfg.get("num_vehicles", 51))),
         vehicle_capacity=int(env_cfg.get("vehicle_capacity", 6)),
         request_timeout_sec=int(env_cfg.get("request_timeout_sec", 600)),
         debug_mask=bool(env_cfg.get("debug_mask", False)),
@@ -138,6 +139,10 @@ def build_train_config(config: Dict[str, Any], args) -> MOHITOTrainConfig:
         hidden_dim=int(mohito_cfg.get("hidden_dim", 50)),
         heads=int(mohito_cfg.get("heads", 2)),
         grid_size=int(mohito_cfg.get("grid_size", 10)),
+        update_every_steps=int(mohito_cfg.get("update_every_steps", 64)),
+        graph_mode=str(mohito_cfg.get("graph_mode", "compact")),
+        use_amp=bool(mohito_cfg.get("use_amp", True)),
+        amp_dtype=str(mohito_cfg.get("amp_dtype", "fp16")),
     )
 
 

@@ -52,12 +52,6 @@
 - [x] 选模准则：mean_rho 为主，service_rate 为次
 - [x] 保留 `best_rho`, `best_service_rate`, `last` checkpoint
 
-### 0.5 验收标准 ⏳ (待实际训练验证)
-- [ ] L1/L2不再超时推进，必须rho≥trigger才换关
-- [ ] L3 phase切换时epsilon连续、奖励渐进
-- [ ] 使用固定seed评估选出的best模型，rho≥0.5
-- [ ] 训练曲线显示phase3不再出现回撤
-
 ---
 
 ## 1. MOHITO/Wu2024 域内训练 (高优先级)
@@ -66,10 +60,10 @@
 
 ```bash
 # Wu2024 (200k steps, ~2-4h on GPU)
-nohup python scripts/run_wu2024_train.py --config configs/manhattan.yaml --device cuda > wu2024_train.log 2>&1 &
+nohup python scripts/run_wu2024_train.py --config configs/manhattan_curriculum_v13.yaml --device cuda > wu2024_train.log 2>&1 &
 
 # MOHITO (需要torch_geometric)
-nohup python scripts/run_mohito_train.py --config configs/manhattan.yaml --device cuda > mohito_train.log 2>&1 &
+nohup python scripts/run_mohito_train.py --config configs/manhattan_curriculum_v13.yaml --device cuda > mohito_train.log 2>&1 &
 ```
 
 **验收标准：**

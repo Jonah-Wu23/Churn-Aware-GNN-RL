@@ -30,6 +30,9 @@ mapping:
 env:
   max_horizon_steps: 6000
   mask_alpha: 3.0
+  # Avoid action-space collapse when an onboard passenger is already late under the best possible route.
+  hard_mask_skip_unrecoverable: true
+  hard_mask_slack_sec: 0.0
   walk_threshold_sec: 600
   max_requests: 1500
   seed: 7
@@ -68,7 +71,7 @@ env:
   graph_edges_path: "data/processed/graph/layer2_edges.parquet"
   graph_embeddings_path: "data/processed/graph/node2vec_embeddings.parquet"
   # Time-based train/eval split: "train" uses first 30%, "eval" uses remaining 70%
-  time_split_mode: "train"   # Set to "train" or "eval" to enable split
+  time_split_mode: "eval"   # Set to "train" or "eval" to enable split
   time_split_ratio: 0.3
 
   # Fleet-Aware Edge Potential (FAEP) - default disabled for backward compatibility
@@ -138,6 +141,19 @@ eval:
   policy: random
   device: cuda
   max_steps: null
+  parallel_episodes: 5
+  fast_eval_disable_debug: true
+  allow_cuda_parallel: true
+  env_overrides:
+    max_sim_time_sec: 900
+    max_horizon_steps: 999999
+    max_requests: 800
+    num_vehicles: 100
+    demand_exhausted_min_time_sec: 900
+    allow_demand_exhausted_termination: false
+    churn_tol_sec: 900
+    waiting_churn_tol_sec: 900
+    onboard_churn_tol_sec: 900
   # HCRide baseline config
   hcride:
     alpha: 1.5
@@ -197,7 +213,7 @@ sumo:
 curriculum:
   stages: [L0, L1, L2, L3]
   strict_stage_params: true  # Fail-fast mode for unrecognized stage_params fields
-  trigger_service_rate: 0.7
+  trigger_service_rate: 0.4
   gamma: 1.0
   stage_max_steps: 50000
   stage_steps:
@@ -215,7 +231,7 @@ curriculum:
   stage_extension_steps: 30000
   max_stage_extensions: 2
   fail_policy: "fail_fast"
-  service_rate_warning_threshold: 0.35  # 70% of trigger_service_rate
+  service_rate_warning_threshold: 0.28  # 70% of trigger_service_rate
   
   # Collapse protection
   collapse_drop_delta: 0.10
@@ -265,35 +281,53 @@ curriculum:
     phase2_steps: 15000
     behavior_cloning:
       enabled: true
-      steps: 10000
+      steps: 5000
       log_every: 500
       teacher_congestion_weight: 0.5
       teacher_coverage_weight: 0.3
     phase1_env_overrides:
-      reward_service: 6.0
-      reward_waiting_churn_penalty: 0.1
-      reward_onboard_churn_penalty: 0.2
-      reward_fairness_weight: 0.0
-      reward_cvar_penalty: 0.0
+      reward_waiting_churn_penalty: 1.0
+      reward_terminal_backlog_penalty: 10.0
+      reward_scale: 30.0
+      reward_service_transform: "log1p"
+      reward_service_transform_scale: 60.0
+      reward_tacc_transform: "log1p"
+      reward_tacc_transform_scale: 60.0
+      reward_step_backlog_penalty: 0.003
+      reward_waiting_time_penalty_per_sec: 0.00003
+      reward_congestion_penalty: 0.05
+      reward_onboard_delay_weight: 0.1
       reward_potential_alpha: 0.3
       reward_potential_lost_weight: 1.0
       reward_potential_scale_with_reward_scale: false
     phase2_env_overrides:
-      reward_service: 4.0
-      reward_waiting_churn_penalty: 0.2
-      reward_onboard_churn_penalty: 0.5
-      reward_fairness_weight: 0.5
-      reward_cvar_penalty: 0.5
-      reward_potential_alpha: 0.1
+      reward_waiting_churn_penalty: 1.0
+      reward_terminal_backlog_penalty: 10.0
+      reward_scale: 30.0
+      reward_service_transform: "log1p"
+      reward_service_transform_scale: 60.0
+      reward_tacc_transform: "log1p"
+      reward_tacc_transform_scale: 60.0
+      reward_step_backlog_penalty: 0.003
+      reward_waiting_time_penalty_per_sec: 0.00009
+      reward_congestion_penalty: 0.075
+      reward_onboard_delay_weight: 0.3
+      reward_potential_alpha: 0.175
       reward_potential_lost_weight: 1.0
       reward_potential_scale_with_reward_scale: false
     # Phase3 explicitly inherits from phase2 (never empty!)
     phase3_env_overrides:
-      reward_service: 4.0
-      reward_waiting_churn_penalty: 0.2
-      reward_onboard_churn_penalty: 0.5
-      reward_fairness_weight: 0.5
-      reward_cvar_penalty: 0.5
+      reward_waiting_churn_penalty: 1.0
+      reward_terminal_backlog_penalty: 10.0
+      reward_scale: 30.0
+      reward_service_transform: "log1p"
+      reward_service_transform_scale: 60.0
+      reward_tacc_transform: "log1p"
+      reward_tacc_transform_scale: 60.0
+      reward_step_backlog_penalty: 0.003
+      reward_waiting_time_penalty_per_sec: 0.00015
+      reward_congestion_penalty: 0.10
+      reward_onboard_delay_weight: 0.5
       reward_potential_alpha: 0.05
       reward_potential_lost_weight: 1.0
       reward_potential_scale_with_reward_scale: false
@@ -369,10 +403,16 @@ curriculum:
       churn_tol_override_sec: 900
       env_overrides:
         reward_congestion_penalty: 0.20
+        num_vehicles: 100
 
 # MOHITO in-domain training config (L2 unified protocol)
 mohito_train:
   total_steps: 200000
+  num_vehicles: 100
+  graph_mode: "compact"
+  update_every_steps: 64
+  use_amp: true
+  amp_dtype: "fp16"
   learning_rate: 0.001
   entropy_coef: 0.01
   value_loss_coef: 0.5
@@ -388,6 +428,7 @@ mohito_train:
 # Wu2024 in-domain training config (L2 unified protocol)
 wu2024_train:
   total_steps: 200000
+  num_vehicles: 100
   learning_rate: 0.0005
   entropy_coef: 0.01
   value_loss_coef: 0.5
@@ -398,3 +439,11 @@ wu2024_train:
   hidden_size: 128
   num_layers: 1
   dropout: 0.1
+
+# MAPPO in-domain training config
+mappo_train:
+  num_vehicles: 100
+
+# CPO in-domain training config
+cpo_train:
+  num_vehicles: 100

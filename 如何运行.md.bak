@@ -1,0 +1,652 @@
+# 如何运行（EdgeQ-DQN + 课程学习 + Baselines）
+
+这份文档按“当前实现”给出可复现实验流程：数据准备 → EdgeQ 课程学习训练 → 统一评估（含 baselines）→ 消融实验。  
+注：如果 `todos.md` 里仍标注有 Doc vs Implementation Drift，以实现为准；本文只保证“按当前代码能跑通”。
+
+---
+
+## 0. 你要先具备的东西（一次性准备）
+
+### 0.1 数据与图（必须）
+在仓库根目录依次执行（推荐使用当前主配置 `configs/manhattan_curriculum_v13.yaml`）：
+
+1.（可选）过滤 bbox：  
+`python scripts/filter_taxi_bbox.py --config configs/manhattan_curriculum_v13.yaml`
+
+2. OD 映射到合法站点：  
+`python scripts/map_od.py --config configs/manhattan_curriculum_v13.yaml`  
+（可选）使用多进程并行加速（推荐）：  
+`python scripts/map_od.py --config configs/manhattan_curriculum_v13.yaml --n-jobs -1`  
+（`--n-jobs -1` 表示使用所有CPU核心，也可指定具体数字如 `--n-jobs 4`）
+
+3. 构建 Layer-2 逻辑图：  
+`python scripts/build_graph.py --config configs/manhattan_curriculum_v13.yaml`
+
+4.（推荐）生成审计与可视化：  
+`python scripts/audit_graph.py --config configs/manhattan_curriculum_v13.yaml`
+
+5. 训练 Node2Vec embeddings（GNN node 特征需要）：  
+`python scripts/train_node2vec.py --config configs/manhattan_curriculum_v13.yaml`
+
+检查点（不满足就不要往下跑训练）：
+- `data/processed/graph/layer2_nodes.parquet` 存在
+- `data/processed/graph/layer2_edges.parquet` 存在
+- `data/processed/graph/node2vec_embeddings.parquet` 存在
+- `data/processed/od_mapped/*.parquet` 存在
+
+---
+
+## 1. EdgeQ 课程学习训练（DQNTrainer）
+
+### 1.1 训练命令（推荐配置）
+`python scripts/run_curriculum_train.py --config configs/manhattan_curriculum_v13.yaml --run-dir reports/runs/my_edgeq`
+
+训练输出（你之后评估要用）：
+- 每个 stage 目录下会有 `edgeq_model_best.pt`（推荐用于评估/继续训练）
+- 同时会有 `edgeq_model_latest.pt`、`edgeq_model_final.pt`（用于对照）
+- 训练日志：`train_log.jsonl`、`reward_terms.jsonl`
+- 课程日志：`curriculum_log.jsonl`
+
+如果你只想跑一个阶段（例如只跑 L3），请在 `configs/manhattan_curriculum_v13.yaml` 的 `curriculum.stages` 里改成你想要的列表。
+
+### 1.2 我现在的实际用法：直接停，用 best 当结果
+如果你发现训练进入延长阶段但你已经观察到 eval 指标达标，**可以直接停止训练**，以当前 run 的 `stage_L3/edgeq_model_best.pt` 作为最终模型参与论文对比（不强制要求 curriculum “通过”）。
+
+### 1.3 从某个阶段继续训练（AutoDL 常用）
+`python scripts/run_curriculum_train.py --config configs/manhattan_curriculum_v13.yaml --start-stage L3 --init-model-path reports/runs/XXXX/stage_L3/edgeq_model_best.pt`
+
+### 1.4 常用可调参数（在 `configs/manhattan_curriculum_v13.yaml`）
+你可以新增/修改以下键（没有就会使用默认值）：
+- `train.total_steps`、`train.learning_rate`、`train.buffer_size`、`train.batch_size`
+- `train.epsilon_start`、`train.epsilon_end`、`train.epsilon_decay_steps`
+- `train.checkpoint_every_steps`（保存 `edgeq_model_latest.pt` 的频率）
+- `model.hidden_dim`、`model.num_layers`、`model.dropout`
+
+---
+
+## 1.5 Teacher-Student 蒸馏（学生 MLP，秒级推理）
+
+目标：用已训练好的 EdgeQ Teacher 生成蒸馏数据，训练小型 MLP 学生，部署时秒级响应。
+
+### 1.5.1 生成蒸馏数据
+```powershell
+python scripts/run_distill_dataset.py `
+  --config configs/manhattan_curriculum_v13.yaml `
+  --teacher-model reports/runs/XXXX/stage_L3/edgeq_model_best.pt `
+  --output data/processed/distill/distill_L3.npz `
+  --episodes 20 `
+  --device cuda
+```
+
+### 1.5.2 训练学生模型
+```powershell
+python scripts/run_distill_train.py `
+  --dataset data/processed/distill/distill_L3.npz `
+  --epochs 10 `
+  --batch-size 64 `
+  --device cuda `
+  --run-dir reports/distill/student_L3
+```
+
+### 1.5.3 评估学生模型
+```powershell
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+  --policy student_mlp `
+  --model-path reports/distill/student_L3/student_mlp_best.pt `
+  --run-dir reports/eval/student_mlp_L3
+```
+
+---
+
+## 2. 评估
+
+评估脚本是统一的：`scripts/run_eval.py`，支持你的EdgeQ模型和5个论文所需的baseline。
+
+### 2.1 论文所需的基线清单
+
+根据实验设计，论文需要对比以下5个学术基线：
+
+| Baseline | 文献来源 | 实现状态 | 需要训练 |
+|---------|---------|---------|---------|
+| **HCRide** | Jiang et al., IJCAI 2025 | ✅ 已实现 | ❌ 无需训练（启发式） |
+| **MAPPO** | Yu et al., NeurIPS 2022 | ✅ 已实现 | ✅ 需域内训练 |
+| **CPO** | Achiam et al., ICML 2017 | ✅ 已实现 | ✅ 需域内训练 |
+| **MOHITO** | Anil et al., UAI 2025 | ✅ 已实现 | ✅ 需域内训练 |
+| **Wu2024** | Wu et al., C&IE 2024 | ✅ 已实现 | ✅ 需域内训练 |
+
+所有baseline使用统一的 `EventDrivenEnv`、相同的reward函数、相同的action mask机制，确保公平对比。
+
+---
+
+### 2.2 评估 EdgeQ 模型（Mobi-Churn 主模型）
+
+#### 2.2.1 前提条件
+
+确保你有一个可用 checkpoint：优先使用 `stage_L3/edgeq_model_best.pt`（训练未“通过”也可以评估）。
+
+#### 2.2.2 配置评估环境
+
+编辑 `configs/manhattan_curriculum_v13.yaml`（或你的配置文件）：
+
+```yaml
+env:
+  time_split_mode: "eval"  # 重要：使用70%的评估集数据
+  time_split_ratio: 0.3
+
+eval:
+  episodes: 5
+  seed: 7
+  policy: edgeq
+  device: cuda
+  max_steps: null
+```
+
+#### 2.2.3 运行评估
+
+```powershell
+# 方式1：通过 --model-path 参数（推荐）
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+    --model-path reports/runs/XXXX/stage_L3/edgeq_model_best.pt `
+    --run-dir reports/eval/edgeq_L3
+
+# 方式2：在配置文件中指定 model_path，然后运行
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+    --run-dir reports/eval/edgeq_L3
+```
+
+**输出文件：**
+- `reports/eval/edgeq_L3/eval_results.json` - 聚合指标（mean/std）+ 元数据
+- `reports/eval/edgeq_L3/eval_episodes.csv` - 每个episode的详细指标
+
+---
+
+### 2.3 评估 Baseline 1: HCRide（无需训练）
+
+HCRide是基于启发式规则的调度策略，无需预训练。
+
+#### 2.3.1 配置
+
+在 `configs/manhattan_curriculum_v13.yaml` 中已有默认配置（可按需调整）：
+
+```yaml
+eval:
+  policy: hcride
+  hcride:
+    alpha: 1.5                        # 公平性权重
+    lagrange_lambda: 1.0              # 偏好惩罚系数
+    preference_threshold: 0.1         # 频繁访问阈值
+    preference_radius_scale_m: 1000.0 # 偏好半径
+    empty_stop_penalty: 1000000.0     # 空站点惩罚
+```
+
+#### 2.3.2 运行评估
+
+```powershell
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml --run-dir reports/eval/hcride
+```
+
+---
+
+### 2.4 评估 Baseline 2: MAPPO（需域内训练）
+
+MAPPO (Multi-Agent PPO) 使用on-policy库实现，需要先在Manhattan域内训练。
+
+#### 2.4.1 训练MAPPO
+
+**训练脚本：** `scripts/run_mappo_train.py`
+
+**训练命令：**
+```powershell
+# 本地训练（快速测试，1000步）
+python scripts/run_mappo_train.py --config configs/manhattan_curriculum_v13.yaml `
+    --num_env_steps 1000 --run_dir reports/mappo_train/smoke_test
+
+# 完整训练（建议在Autodl GPU上运行）
+cd /root/mini_bus_v13
+PYTHONPATH=/root/mini_bus_v13 nohup python scripts/run_mappo_train.py --config configs/manhattan_curriculum_v13.yaml \
+    --num_env_steps 200000 --cuda > mappo_train.log 2>&1 &
+```
+
+**训练配置（在 `configs/manhattan_curriculum_v13.yaml` 中）：**
+```yaml
+mappo_train:
+  num_vehicles: 100
+```
+
+**训练输出：**
+- `reports/mappo_train/run_XXXXXX/models/actor.pt` - 训练好的actor模型
+- `reports/mappo_train/run_XXXXXX/config.yaml` - 训练配置快照
+- `reports/mappo_train/run_XXXXXX/train_log.jsonl` - 训练日志
+
+#### 2.4.2 评估MAPPO
+
+```powershell
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+    --policy mappo `
+    --model-path reports/mappo_train/run_XXXXXX/models/actor.pt `
+    --run-dir reports/eval/mappo
+```
+
+---
+
+### 2.5 评估 Baseline 3: CPO（需域内训练）
+
+CPO (Constrained Policy Optimization) 使用safety-starter-agents库实现。
+
+#### 2.5.1 训练CPO
+
+**训练脚本：** `scripts/run_cpo_train.py`
+
+**训练命令：**
+```powershell
+# 快速测试
+python scripts/run_cpo_train.py --config configs/manhattan_curriculum_v13.yaml `
+    --max-iter 10 --run-dir reports/cpo_train/smoke_test
+
+# 完整训练（建议在Autodl上运行）
+cd /root/mini_bus_v13
+PYTHONPATH=/root/mini_bus_v13 nohup python scripts/run_cpo_train.py --config configs/manhattan_curriculum_v13.yaml \
+    --target-steps 200000 --max-constraint 10.0 --gpu-index 0 --dtype auto > cpo_train.log 2>&1 &
+
+# 既看屏幕又落盘（推荐，便于及时发现异常）
+cd /root/mini_bus_v13
+PYTHONPATH=/root/mini_bus_v13 python scripts/run_cpo_train.py --config configs/manhattan_curriculum_v13.yaml \
+    --target-steps 200000 --max-constraint 10.0 --gpu-index 0 --dtype auto 2>&1 | tee cpo_train.log
+```
+
+**训练配置（在 `configs/manhattan_curriculum_v13.yaml` 中）：**
+```yaml
+cpo_train:
+  num_vehicles: 100
+```
+
+**训练输出：**
+- `reports/cpo_train/run_XXXXXX/best_model.pkl` - 训练好的模型（包含policy + value + running_state）
+- `reports/cpo_train/run_XXXXXX/config.yaml` - 训练配置
+
+#### 2.5.2 评估CPO
+
+```powershell
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+    --policy cpo `
+    --model-path reports/cpo_train/run_XXXXXX/best_model.pkl `
+    --run-dir reports/eval/cpo
+```
+
+---
+
+### 2.6 评估 Baseline 4: MOHITO（需域内训练）
+
+MOHITO (Multi-Agent RL using Hypergraphs) 使用GAT网络，从随机初始化开始训练。
+
+#### 2.6.1 训练MOHITO
+
+**训练脚本：** `scripts/run_mohito_train.py`
+
+**训练命令：**
+```powershell
+# 快速测试（1000步）
+python scripts/run_mohito_train.py --config configs/manhattan_curriculum_v13.yaml `
+    --total-steps 1000 --run-dir reports/mohito_train/smoke_test
+
+# 完整训练（200k步，约2-4小时，建议在Autodl GPU上运行）
+nohup python scripts/run_mohito_train.py --config configs/manhattan_curriculum_v13.yaml `
+    --total-steps 200000 --device cuda > mohito_train.log 2>&1 &
+```
+
+**训练配置（在 `configs/manhattan_curriculum_v13.yaml` 中）：**
+```yaml
+mohito_train:
+  total_steps: 200000
+  num_vehicles: 100
+  graph_mode: "compact"
+  update_every_steps: 64
+  use_amp: true
+  amp_dtype: "fp16"
+  learning_rate: 0.001
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 5.0
+  eval_every_steps: 10000
+  feature_len: 5
+  num_layers_actor: 20
+  hidden_dim: 50
+  heads: 2
+  grid_size: 10
+```
+
+**训练输出：**
+- `reports/mohito_train/run_XXXXXX/mohito_actor_final.pth` - 训练好的actor
+- `reports/mohito_train/run_XXXXXX/mohito_critic_final.pth` - 训练好的critic
+- `reports/mohito_train/run_XXXXXX/train_log.jsonl` - 训练日志
+
+注：`scripts/run_mohito_train.py` 会优先读取 `mohito_train.num_vehicles`（如果未设置则回退到 `env.num_vehicles`）。
+
+#### 2.6.2 评估MOHITO
+
+```powershell
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+    --policy mohito `
+    --model-path reports/mohito_train/run_XXXXXX/mohito_actor_final.pth `
+    --run-dir reports/eval/mohito
+```
+
+---
+
+### 2.7 评估 Baseline 5: Wu2024（需域内训练）
+
+Wu2024使用PointerNet架构，从随机初始化开始训练。
+
+#### 2.7.1 训练Wu2024
+
+**训练脚本：** `scripts/run_wu2024_train.py`
+
+**训练命令：**
+```powershell
+# 快速测试（1000步）
+python scripts/run_wu2024_train.py --config configs/manhattan_curriculum_v13.yaml `
+    --total-steps 1000 --run-dir reports/wu2024_train/smoke_test
+
+# 完整训练（200k步，约2-4小时，建议在Autodl GPU上运行）
+nohup python scripts/run_wu2024_train.py --config configs/manhattan_curriculum_v13.yaml `
+    --total-steps 200000 --device cuda > wu2024_train.log 2>&1 &
+```
+
+**训练配置（在 `configs/manhattan_curriculum_v13.yaml` 中）：**
+```yaml
+wu2024_train:
+  total_steps: 200000
+  num_vehicles: 100
+  learning_rate: 0.0005
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 5.0
+  eval_every_steps: 10000
+  kmax: 32
+  hidden_size: 128
+  num_layers: 1
+  dropout: 0.1
+```
+
+**训练输出：**
+- `reports/wu2024_train/run_XXXXXX/wu2024_model_final.pt` - 训练好的模型
+- `reports/wu2024_train/run_XXXXXX/train_log.jsonl` - 训练日志
+
+注：`scripts/run_wu2024_train.py` 会优先读取 `wu2024_train.num_vehicles`（如果未设置则回退到 `env.num_vehicles`）。
+
+#### 2.7.2 评估Wu2024
+
+```powershell
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+    --policy wu2024 `
+    --model-path reports/wu2024_train/run_XXXXXX/wu2024_model_final.pt `
+    --run-dir reports/eval/wu2024
+```
+
+---
+
+### 2.8 评估输出格式说明
+
+所有策略的评估输出格式完全一致，便于对比分析。
+
+**文件结构：**
+```
+reports/eval/{policy_name}/
+├── eval_results.json   # 聚合结果 + 元数据
+└── eval_episodes.csv   # 每个episode的详细数据
+```
+
+**eval_results.json 内容示例：**
+```json
+{
+  "meta": {
+    "config_path": "configs/manhattan_curriculum_v13.yaml",
+    "config_sha256": "...",
+    "eval_config": {
+      "episodes": 5,
+      "seed": 7,
+      "policy": "edgeq",
+      "device": "cuda"
+    },
+    "graph_hashes": {...},
+    "od_hashes": {...}
+  },
+  "aggregate": {
+    "policy": "edgeq",
+    "episodes": 5,
+    "service_rate_mean": 0.XX,
+    "service_rate_std": 0.XX,
+    "waiting_churn_rate_mean": 0.XX,
+    "onboard_churn_rate_mean": 0.XX,
+    "tacc_total_mean": XXXX.XX,
+    "service_gini_mean": 0.XX,
+    "wait_time_p95_sec_mean": XXX.XX
+  },
+  "episodes": [...]
+}
+```
+
+**关键指标解释：**
+- `service_rate`：服务率 = served / (total - structural_unserviceable)
+- `waiting_churn_rate`：等待流失率（含超时 + 等待不耐烦）
+- `onboard_churn_rate`：车上流失率（车上不耐烦）
+- `tacc_total`：Total Avoided Private Car Travel Time（论文North-star指标）
+- `service_gini`：停靠点服务量基尼系数（公平性指标，使用aligned vector计算）
+- `wait_time_p95_sec`：等待时间95分位数（尾部延迟指标）
+
+---
+
+### 2.9 批量评估所有baseline
+
+为了论文实验，可以编写批量评估脚本：
+
+**示例：批量评估所有已训练的baseline**
+```powershell
+# 定义所有baseline及其model路径
+$baselines = @{
+    "edgeq"  = "reports/runs/XXXX/stage_L3/edgeq_model_best.pt"
+    "hcride" = $null  # 无需模型
+    "mappo"  = "reports/mappo_train/run_XXXXXX/models/actor.pt"
+    "cpo"    = "reports/cpo_train/run_XXXXXX/best_model.pkl"
+    "mohito" = "reports/mohito_train/run_XXXXXX/mohito_actor_final.pth"
+    "wu2024" = "reports/wu2024_train/run_XXXXXX/wu2024_model_final.pt"
+}
+
+foreach ($policy in $baselines.Keys) {
+    Write-Host "Evaluating $policy..." -ForegroundColor Green
+    
+    if ($baselines[$policy]) {
+        # 需要模型的baseline
+        python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+            --policy $policy `
+            --model-path $baselines[$policy] `
+            --run-dir "reports/eval/$policy"
+    } else {
+        # 无需模型的baseline（如hcride）
+        python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml `
+            --run-dir "reports/eval/$policy"
+    }
+}
+
+Write-Host "All baselines evaluated!" -ForegroundColor Cyan
+```
+
+---
+
+### 2.10 重要注意事项
+
+#### 2.10.1 数据划分一致性
+
+**训练时：**
+```yaml
+env:
+  time_split_mode: "train"  # 使用前30%数据
+  time_split_ratio: 0.3
+```
+
+**评估时：**
+```yaml
+env:
+  time_split_mode: "eval"   # 使用后70%数据
+  time_split_ratio: 0.3
+```
+
+#### 2.10.2 种子一致性
+
+所有baseline评估时使用相同的 `eval.seed: 7`，确保：
+- OD数据采样一致
+- Episode顺序一致
+- 公平对比
+
+#### 2.10.3 验收标准
+
+根据 `todos.md`，训练后的baseline需满足：
+- ✅ 服务率 (service_rate) ≥ 30%
+- ✅ 训练收敛（service_rate在eval split上稳定）
+- ✅ 保存了统一格式的checkpoint（含config_hash、git_commit）
+
+#### 2.10.4 设备选择
+
+- **CPU评估**：可运行所有策略，但MOHITO/Wu2024较慢
+- **GPU评估**（推荐）：显著加速GNN/GAT模型推理
+
+---
+
+
+---
+
+## 3. 消融实验（Ablation Studies）
+
+消融实验用于验证 Mobi-Churn 架构的三大核心创新的必要性。
+
+### 3.1 消融变体说明
+
+| 变体 | 验证目标 | 核心修改 | 预期表现 |
+|------|----------|----------|----------|
+| **w/o Edge-Encoding** | 边决策机制 | 使用 GATConv (Node-Only GNN) | 接单率高但流失率上升 |
+| **w/o Risk-Awareness** | 风险感知与公平性 | 同时消融 Reward + Feature 层 | 平均等待好但尾部爆炸 |
+| **w/o Curriculum** | 课程学习 | 直接在 L3 阶段训练 | 收敛极慢或无法收敛 |
+
+---
+
+### 3.2 消融训练（在 AutoDL 上运行）
+
+**训练脚本：** `scripts/run_ablation_train.py`
+
+```powershell
+# w/o Edge-Encoding
+python scripts/run_ablation_train.py --ablation no_edge --config configs/ablation/no_edge.yaml
+
+# w/o Risk-Awareness
+python scripts/run_ablation_train.py --ablation no_risk --config configs/ablation/no_risk.yaml
+
+# w/o Curriculum
+python scripts/run_ablation_train.py --ablation no_curriculum --config configs/ablation/no_curriculum.yaml
+```
+
+**训练输出：**
+- `reports/runs/ablation_{type}_{timestamp}/model_final.pt` - 训练好的模型
+- `reports/runs/ablation_{type}_{timestamp}/ablation_meta.json` - 消融元数据
+- `reports/runs/ablation_{type}_{timestamp}/train_log.jsonl` - 训练日志
+
+---
+
+### 3.3 消融评估（本地或 AutoDL）
+
+**评估脚本：** `scripts/run_ablation_eval.py`（完全独立于 baseline 评估脚本）
+
+#### 3.3.1 单个消融变体评估
+
+```powershell
+# 评估 w/o Edge-Encoding
+python scripts/run_ablation_eval.py `
+    --ablation no_edge `
+    --model-path reports/runs/ablation_no_edge_{timestamp}/model_final.pt `
+    --config configs/ablation/no_edge.yaml `
+    --output-dir reports/ablation_results
+
+# 评估 w/o Risk-Awareness
+python scripts/run_ablation_eval.py `
+    --ablation no_risk `
+    --model-path reports/runs/ablation_no_risk_{timestamp}/model_final.pt `
+    --config configs/ablation/no_risk.yaml `
+    --output-dir reports/ablation_results
+```
+
+#### 3.3.2 Dry-run 测试（使用随机权重）
+
+```powershell
+# 不需要预训练模型，验证评估流程
+python scripts/run_ablation_eval.py `
+    --ablation no_edge `
+    --config configs/ablation/no_edge.yaml `
+    --dry-run
+```
+
+---
+
+### 3.4 评估指标
+
+**主表指标（论文 Table）：**
+
+| 指标 | 说明 | 方向 |
+|------|------|------|
+| **TACC** | 总避免私家车通勤时间 | ↑ |
+| **Churn Rate** | 系统总流失率 | ↓ |
+| **Wait Time P95** | 95百分位等待时间 | ↓ |
+| **Suburban Service Rate** | 郊区服务率 | ↑ |
+
+**诊断指标（附录）：**
+- Churn 分解 (waiting vs onboard) - 支撑 w/o Edge 论证
+- Service Gini - 支撑 w/o Risk 论证  
+- Stuckness Ratio - 仅用于 w/o Curriculum
+
+---
+
+### 3.5 评估输出格式
+
+```
+reports/ablation_results/
+├── ablation_results.json   # JSON 格式汇总
+└── ablation_comparison.md  # Markdown 对比表格
+```
+
+**ablation_results.json 示例：**
+```json
+{
+  \"ablation_type\": \"no_edge\",
+  \"main_metrics\": {
+    \"tacc\": 1234.5,
+    \"churn_rate\": 0.15,
+    \"wait_time_p95\": 180.0,
+    \"suburban_service_rate\": 0.72
+  },
+  \"diagnostic_metrics\": {
+    \"waiting_churn_count\": 25,
+    \"onboard_churn_count\": 12,
+    \"service_gini\": 0.28
+  }
+}
+```
+
+---
+
+### 3.6 配置文件
+
+消融配置文件位于 `configs/ablation/` 目录：
+
+| 文件 | 消融类型 |
+|------|----------|
+| `no_edge.yaml` | w/o Edge-Encoding |
+| `no_risk.yaml` | w/o Risk-Awareness |
+| `no_curriculum.yaml` | w/o Curriculum |
+
+---
+
+### 3.7 单元测试
+
+```powershell
+# 运行消融测试（PyG 相关测试在本地自动跳过）
+python -m pytest tests/test_ablation.py -v
+```
+

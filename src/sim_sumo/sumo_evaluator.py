@@ -238,6 +238,8 @@ def _build_sumo_env_config(env_cfg: Dict[str, Any], sumo_cfg: Dict[str, Any]) ->
             "stop_to_sumo_edge_path",
             "data/processed/graph/stop_to_sumo_edge.json",
         ),
+        hard_mask_skip_unrecoverable=bool(env_cfg.get("hard_mask_skip_unrecoverable", False)),
+        hard_mask_slack_sec=float(env_cfg.get("hard_mask_slack_sec", 0.0)),
     )
 
 

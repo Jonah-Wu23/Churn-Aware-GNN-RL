@@ -60,6 +60,11 @@ class MOHITOTrainConfig:
     hidden_dim: int = 50
     heads: int = 2
     grid_size: int = 10
+    # Memory/perf controls (critical for large horizons)
+    update_every_steps: int = 64
+    graph_mode: str = "compact"  # compact/full, see src.baselines.mohito_adapter.build_mohito_graph
+    use_amp: bool = True
+    amp_dtype: str = "fp16"  # fp16/bf16 (only used when use_amp and CUDA)
 
 
 class MLPCritic(nn.Module):
@@ -145,6 +150,11 @@ class MOHITOTrainer:
         _ensure_pyg_imports()
         
         from mohitoR.gat import ActorNetwork, ActorGNN
+        # Upstream sets anomaly detection True; disable for performance/stability.
+        try:
+            torch.autograd.set_detect_anomaly(False)
+        except Exception:
+            pass
         
         # Create actor (random init)
         self.actor = ActorNetwork(
@@ -184,6 +194,26 @@ class MOHITOTrainer:
         self.ep_values: List[torch.Tensor] = []
         self.ep_rewards: List[float] = []
         self.ep_entropies: List[torch.Tensor] = []
+
+        try:
+            self._scaler = torch.amp.GradScaler(
+                device_type="cuda",
+                enabled=bool(self.config.use_amp) and self.device.type == "cuda",
+            )
+        except Exception:
+            self._scaler = torch.cuda.amp.GradScaler(
+                enabled=bool(self.config.use_amp) and self.device.type == "cuda"
+            )
+
+    def _autocast_ctx(self):
+        if not (bool(self.config.use_amp) and self.device.type == "cuda"):
+            return torch.autocast(device_type="cpu", enabled=False)
+        dtype = str(self.config.amp_dtype).lower().strip()
+        if dtype == "bf16":
+            amp_dtype = torch.bfloat16
+        else:
+            amp_dtype = torch.float16
+        return torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=True)
         
         LOG.info(f"MOHITOTrainer initialized on {self.device}")
         LOG.info(f"Config hash: {self.config_hash}, Graph hash: {self.graph_hash}")
@@ -222,12 +252,17 @@ class MOHITOTrainer:
         
         # Build MOHITO graph
         graph_data, edge_space, action_space = build_mohito_graph(
-            self.env, features, vehicle_idx, self.config.grid_size
+            self.env,
+            features,
+            vehicle_idx,
+            self.config.grid_size,
+            mode=str(self.config.graph_mode),
         )
         graph_data = graph_data.to(self.device)
         
         # Forward through actor GNN to get node embeddings
-        h = self.actor.main.straightforward(graph_data, training=True)
+        with self._autocast_ctx():
+            h = self.actor.main.straightforward(graph_data, training=True)
         
         # Get logits for edge nodes (action candidates)
         # MOHITO uses sum of edge node features as logits
@@ -287,26 +322,30 @@ class MOHITOTrainer:
         
         # Compute value from critic
         pooled = self._pool_graph_features(graph_data, h)
-        value = self.critic(pooled).squeeze()
+        with self._autocast_ctx():
+            value = self.critic(pooled).squeeze()
         
         return int(actions[action_idx]), log_prob, value, entropy
     
-    def _update(self) -> Dict[str, float]:
-        """Perform A2C update at end of episode."""
+    def _update(self, bootstrap_value: torch.Tensor) -> Dict[str, float]:
+        """Perform A2C update on the current rollout buffer.
+
+        This runs frequently (every update_every_steps or on episode end) to
+        bound GPU memory usage under long horizons.
+        """
         if len(self.ep_rewards) == 0:
             return {}
         
-        # Compute returns with bootstrapping
-        returns = []
-        R = 0.0
+        # Compute returns with bootstrapping from the next state value.
+        returns: List[float] = []
+        R = float(bootstrap_value.detach().float().item())
         for r in reversed(self.ep_rewards):
-            R = r + self.config.gamma * R
+            R = float(r) + float(self.config.gamma) * R
             returns.insert(0, R)
-        
         returns = torch.tensor(returns, dtype=torch.float32, device=self.device)
-        values = torch.stack(self.ep_values) if self.ep_values else torch.zeros_like(returns)
-        log_probs = torch.stack(self.ep_log_probs) if self.ep_log_probs else torch.zeros_like(returns)
-        entropies = torch.stack(self.ep_entropies) if self.ep_entropies else torch.zeros_like(returns)
+        values = torch.stack(self.ep_values).float() if self.ep_values else torch.zeros_like(returns)
+        log_probs = torch.stack(self.ep_log_probs).float() if self.ep_log_probs else torch.zeros_like(returns)
+        entropies = torch.stack(self.ep_entropies).float() if self.ep_entropies else torch.zeros_like(returns)
         
         # Normalize returns
         if len(returns) > 1:
@@ -334,20 +373,26 @@ class MOHITOTrainer:
         # Update actor
         self.actor.optimizer.zero_grad()
         self.critic_optimizer.zero_grad()
-        
-        total_loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), self.config.max_grad_norm
-        )
-        torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.max_grad_norm
-        )
-        
-        self.actor.optimizer.step()
+
+        if self._scaler.is_enabled():
+            self._scaler.scale(total_loss).backward()
+            self._scaler.unscale_(self.actor.optimizer)
+            self._scaler.unscale_(self.critic_optimizer)
+        else:
+            total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
+
+        if self._scaler.is_enabled():
+            self._scaler.step(self.actor.optimizer)
+            self._scaler.step(self.critic_optimizer)
+            self._scaler.update()
+        else:
+            self.actor.optimizer.step()
+            self.critic_optimizer.step()
+
         self.actor.scheduler.step()
-        self.critic_optimizer.step()
         
         # Clear buffers
         self.ep_log_probs.clear()
@@ -361,6 +406,25 @@ class MOHITOTrainer:
             "entropy": entropies.mean().item() if len(entropies) > 0 else 0.0,
             "total_loss": total_loss.item(),
         }
+
+    def _compute_state_value(self, features: Dict[str, np.ndarray]) -> torch.Tensor:
+        """Compute critic value for bootstrapping (no grad)."""
+        vehicle = self.env._get_active_vehicle() if hasattr(self.env, "_get_active_vehicle") else None
+        vehicle_idx = getattr(vehicle, "vehicle_id", 0) if vehicle else 0
+        graph_data, edge_space, action_space = build_mohito_graph(
+            self.env,
+            features,
+            vehicle_idx,
+            self.config.grid_size,
+            mode=str(self.config.graph_mode),
+        )
+        graph_data = graph_data.to(self.device)
+        with torch.no_grad():
+            with self._autocast_ctx():
+                h = self.actor.main.straightforward(graph_data, training=False)
+                pooled = self._pool_graph_features(graph_data, h)
+                value = self.critic(pooled).squeeze()
+        return value.detach()
     
     def _save_checkpoint(self, path: Path, is_best: bool = False):
         """Save checkpoint with unified schema."""
@@ -438,24 +502,21 @@ class MOHITOTrainer:
             
             # Store transition for A2C
             if log_prob is not None:
-                self.ep_log_probs.append(log_prob)
-                self.ep_values.append(value)
+                self.ep_log_probs.append(log_prob.float())
+                self.ep_values.append(value.float())
                 self.ep_rewards.append(reward)
-                self.ep_entropies.append(entropy)
+                self.ep_entropies.append(entropy.float())
             
             self.global_step += 1
             
             # Get next features from env (step returns obs dict, not feature batch)
             features = self.env.get_feature_batch()
             
-            # Episode end
+            # Update on fixed rollout window to bound memory (and on episode end).
             if done:
                 self.episode_count += 1
-                
-                # Perform A2C update
-                loss_info = self._update()
-                
-                # Get episode info
+                loss_info = self._update(torch.tensor(0.0, device=self.device))
+
                 ep_info = {
                     "served": info.get("served", 0),
                     "churned_waiting": info.get("churned_waiting", 0),
@@ -465,8 +526,7 @@ class MOHITOTrainer:
                     "tacc_total": info.get("tacc_total", 0.0),
                     "epsilon": epsilon,
                 }
-                
-                # Compute service rate
+
                 total = ep_info["total_requests"]
                 if total > 0:
                     service_rate = ep_info["served"] / total
@@ -474,13 +534,11 @@ class MOHITOTrainer:
                 else:
                     service_rate = 0.0
                     churn_rate = 0.0
-                
                 ep_info["service_rate"] = service_rate
                 ep_info["churn_rate"] = churn_rate
-                
-                # Log
+
                 self._log_episode(ep_info, loss_info)
-                
+
                 if self.global_step % self.config.log_every_steps < 100:
                     LOG.info(
                         f"Step {self.global_step}/{total_steps} | "
@@ -490,27 +548,28 @@ class MOHITOTrainer:
                         f"TACC: {ep_info['tacc_total']:.1f} | "
                         f"Loss: {loss_info.get('total_loss', 0):.4f}"
                     )
-                
-                # Update best
+
                 if service_rate > self.best_service_rate:
                     self.best_service_rate = service_rate
-                    self._save_checkpoint(
-                        self.run_dir / "mohito_actor_best.pth", is_best=True
-                    )
-                
-                # Checkpoint
+                    self._save_checkpoint(self.run_dir / "mohito_actor_best.pth", is_best=True)
+
                 if self.global_step % self.config.checkpoint_every_steps < 100:
-                    self._save_checkpoint(
-                        self.run_dir / f"checkpoint_{self.global_step}.pth"
-                    )
-                
-                # Evaluation callback
+                    self._save_checkpoint(self.run_dir / f"checkpoint_{self.global_step}.pth")
+
                 if eval_callback and self.global_step % self.config.eval_every_steps < 100:
                     eval_callback(self.global_step)
-                
-                # Reset
+
                 self.env.reset()
                 features = self.env.get_feature_batch()
+            elif int(self.config.update_every_steps) > 0 and len(self.ep_rewards) >= int(self.config.update_every_steps):
+                bootstrap = self._compute_state_value(features)
+                loss_info = self._update(bootstrap)
+                if self.global_step % self.config.log_every_steps < 100:
+                    LOG.info(
+                        "MOHITO rollout update at step %d: loss=%.4f",
+                        self.global_step,
+                        float(loss_info.get("total_loss", 0.0)),
+                    )
         
         # Save final model
         self._save_checkpoint(self.run_dir / "mohito_actor_final.pth")

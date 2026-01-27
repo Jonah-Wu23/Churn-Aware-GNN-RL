@@ -19,6 +19,13 @@ import networkx as nx
 import pandas as pd
 
 from src.utils.fairness import gini_coefficient
+from src.utils.hard_mask import (
+    DEFAULT_MAX_TIME_SEC,
+    HardMaskGate,
+    compute_hard_mask_gate,
+    hard_deadline_over_by_sec,
+    sanitize_time_sec,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -77,6 +84,9 @@ class SUMOEnvConfig:
     stop_to_sumo_edge_path: str = "data/processed/graph/stop_to_sumo_edge.json"
     
     travel_time_fallback_multiplier: float = 1.2
+    # Hard-mask robustness: avoid action-space collapse when deadlines are already missed.
+    hard_mask_skip_unrecoverable: bool = False
+    hard_mask_slack_sec: float = 0.0
     
     def __post_init__(self) -> None:
         if self.waiting_churn_tol_sec is None:
@@ -87,6 +97,8 @@ class SUMOEnvConfig:
             self.onboard_churn_tol_sec = int(self.churn_tol_sec)
         if self.onboard_churn_beta is None:
             self.onboard_churn_beta = float(self.churn_beta)
+        if self.hard_mask_slack_sec < 0:
+            raise ValueError("hard_mask_slack_sec must be >= 0")
 
 
 @dataclass
@@ -531,6 +543,34 @@ class SUMOEnv:
         actions = [dst for dst, _ in candidates]
         mask = []
         debug_entries = []
+        hard_mask_skipped = []
+        hard_mask_gate_by_id: Dict[int, HardMaskGate] = {}
+        if vehicle.onboard:
+            for pax in vehicle.onboard:
+                pickup_time_sec = pax.get("pickup_time_sec")
+                t_max_sec = pax.get("t_max_sec")
+                dropoff_stop_id = pax.get("dropoff_stop_id")
+                if dropoff_stop_id is None:
+                    continue
+                gate = compute_hard_mask_gate(
+                    pickup_time_sec=pickup_time_sec,
+                    t_max_sec=t_max_sec,
+                    current_time_sec=float(self.current_time),
+                    best_remaining_sec=self._shortest_time(vehicle.current_stop, int(dropoff_stop_id)),
+                    slack_sec=float(self.config.hard_mask_slack_sec),
+                    max_time_sec=DEFAULT_MAX_TIME_SEC,
+                    skip_unrecoverable=bool(self.config.hard_mask_skip_unrecoverable),
+                )
+                hard_mask_gate_by_id[id(pax)] = gate
+                if not gate.enforce:
+                    hard_mask_skipped.append(
+                        {
+                            "request_id": pax.get("request_id"),
+                            "dropoff_stop_id": int(dropoff_stop_id),
+                            "baseline_eta_sec": float(gate.baseline_eta_sec),
+                            "baseline_over_by_sec": float(gate.baseline_over_by_sec),
+                        }
+                    )
         
         for dst, travel in candidates:
             feasible = True
@@ -552,10 +592,20 @@ class SUMOEnv:
                 })
             
             for pax in vehicle.onboard:
-                remaining = self._shortest_time(dst, pax["dropoff_stop_id"])
-                eta_total = self.current_time + travel + remaining
-                over_by = eta_total - pax["pickup_time_sec"] - pax["t_max_sec"]
-                if over_by > 0:
+                gate = hard_mask_gate_by_id.get(id(pax))
+                if gate is not None and not gate.enforce:
+                    continue
+                remaining = sanitize_time_sec(
+                    self._shortest_time(dst, pax["dropoff_stop_id"]),
+                    max_time_sec=DEFAULT_MAX_TIME_SEC,
+                )
+                eta_total = float(self.current_time) + float(travel) + float(remaining)
+                pickup_time_sec = pax.get("pickup_time_sec")
+                t_max_sec = pax.get("t_max_sec")
+                if pickup_time_sec is None or t_max_sec is None:
+                    continue
+                over_by = hard_deadline_over_by_sec(eta_total, float(pickup_time_sec), float(t_max_sec))
+                if over_by > float(self.config.hard_mask_slack_sec):
                     feasible = False
                     violations.append({
                         "type": "hard_mask",
@@ -576,6 +626,17 @@ class SUMOEnv:
                     "vehicle_id": int(vehicle.vehicle_id),
                     "violations": violations,
                 })
+        
+        if hard_mask_skipped and (debug or self.config.debug_mask):
+            debug_entries.insert(
+                0,
+                {
+                    "type": "hard_mask_skip_unrecoverable",
+                    "vehicle_id": int(vehicle.vehicle_id),
+                    "slack_sec": float(self.config.hard_mask_slack_sec),
+                    "skipped": hard_mask_skipped,
+                },
+            )
         
         if debug or self.config.debug_mask:
             self.last_mask_debug = debug_entries

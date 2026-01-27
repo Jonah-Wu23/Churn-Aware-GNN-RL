@@ -80,7 +80,7 @@ class CPOEnvWrapper(gym.Env):
         # - Onboard summary: 4 (count_normalized, avg_delay, max_delay, capacity_ratio)
         # - Position embedding: 1 (geo embedding of current stop)
         self.node_feat_dim = 5
-        self.edge_feat_dim = 4
+        self.edge_feat_dim = 5 if self.env.config.use_fleet_potential else 4
         self.onboard_dim = 4
         self.pos_dim = 1
         self.obs_dim = (

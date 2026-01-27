@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import multiprocessing as mp
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,16 +16,26 @@ import pandas as pd
 import torch
 
 from src.env.gym_env import EnvConfig, EventDrivenEnv
+from src.models.student_mlp import StudentActionMLP
 from src.train.dqn import build_hashes
 from src.utils.hashing import sha256_file
 from src.utils.fairness import compute_service_volume_gini
 from src.utils.feature_spec import get_edge_dim, validate_checkpoint_edge_dim
+from src.utils.distill_features import build_action_vectors
 
 # Lazy imports to avoid dependency issues
 EdgeQGNN = None  # Loaded on demand if policy=edgeq
 MAPPOEnvConfig = None  # Loaded on demand if policy=mappo
 MAPPOEnvWrapper = None
 DiscretePolicy = None  # Loaded on demand if policy=cpo
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+LOG = logging.getLogger(__name__)
+_EVAL_WORKER_CACHE: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
 
 
 @dataclass(frozen=True)
@@ -34,6 +46,9 @@ class EvalConfig:
     model_path: Optional[str] = None
     device: str = "cpu"
     max_steps: Optional[int] = None
+    parallel_episodes: int = 1
+    fast_eval_disable_debug: bool = False
+    allow_cuda_parallel: bool = False
 
 
 
@@ -81,7 +96,12 @@ def _compute_metrics(env: EventDrivenEnv, total_tacc: float) -> Dict[str, float]
     
     # Get remaining counts
     waiting_remaining = float(sum(len(q) for q in env.waiting.values()))
-    onboard_remaining = float(sum(len(v.onboard) for v in env.fleet.values()))
+    fleet = getattr(env, "fleet", None)
+    if isinstance(fleet, dict):
+        onboard_remaining = float(sum(len(v.onboard) for v in fleet.values()))
+    else:
+        vehicles = getattr(env, "vehicles", [])
+        onboard_remaining = float(sum(len(v.onboard) for v in vehicles))
     
     # Build episode log for unified functions
     episode_log = {
@@ -153,6 +173,384 @@ def _compute_metrics(env: EventDrivenEnv, total_tacc: float) -> Dict[str, float]
     }
 
 
+def _policy_cache_key(
+    policy: str,
+    model_path: Optional[str],
+    device: torch.device,
+    eval_env_cfg: Dict[str, Any],
+    mappo_cfg: Dict[str, Any],
+    cpo_cfg: Dict[str, Any],
+    student_mlp_cfg: Dict[str, Any],
+) -> Tuple[Any, ...]:
+    edge_dim = int(get_edge_dim(eval_env_cfg))
+    neighbor_k_mappo = int(mappo_cfg.get("neighbor_k", 8))
+    neighbor_k_cpo = int(cpo_cfg.get("neighbor_k", 8))
+    student_hidden = int(student_mlp_cfg.get("hidden_dim", 64))
+    student_layers = int(student_mlp_cfg.get("num_layers", 2))
+    student_dropout = float(student_mlp_cfg.get("dropout", 0.1))
+    return (
+        policy,
+        str(model_path) if model_path else None,
+        str(device),
+        edge_dim,
+        neighbor_k_mappo,
+        neighbor_k_cpo,
+        student_hidden,
+        student_layers,
+        student_dropout,
+    )
+
+
+def _load_policy_objects(
+    eval_env_cfg: Dict[str, Any],
+    eval_config: EvalConfig,
+    model_cfg: Dict[str, Any],
+    mappo_cfg: Dict[str, Any],
+    cpo_cfg: Dict[str, Any],
+    student_mlp_cfg: Dict[str, Any],
+    mohito_cfg: Dict[str, Any],
+    wu2024_cfg: Dict[str, Any],
+    device: torch.device,
+) -> Dict[str, Any]:
+    key = _policy_cache_key(
+        eval_config.policy,
+        eval_config.model_path,
+        device,
+        eval_env_cfg,
+        mappo_cfg,
+        cpo_cfg,
+        student_mlp_cfg,
+    )
+    if key in _EVAL_WORKER_CACHE:
+        return _EVAL_WORKER_CACHE[key]
+
+    policy_objects: Dict[str, Any] = {}
+    if eval_config.policy == "edgeq":
+        if not eval_config.model_path:
+            raise ValueError("eval.model_path is required for edgeq policy")
+        from src.models.edge_q_gnn import EdgeQGNN
+
+        env_edge_dim = get_edge_dim(eval_env_cfg)
+        use_fleet_potential = bool(eval_env_cfg.get("use_fleet_potential", False))
+        model = EdgeQGNN(
+            node_dim=int(model_cfg.get("node_dim", 5)),
+            edge_dim=env_edge_dim,
+            hidden_dim=int(model_cfg.get("hidden_dim", 32)),
+            num_layers=int(model_cfg.get("num_layers", 2)),
+            dropout=float(model_cfg.get("dropout", 0.0)),
+            dueling=bool(model_cfg.get("dueling", False)),
+        )
+
+        checkpoint = torch.load(eval_config.model_path, map_location=device)
+        checkpoint_edge_dim = (
+            checkpoint.get("edge_dim", 4)
+            if isinstance(checkpoint, dict) and "edge_dim" in checkpoint
+            else 4
+        )
+        if not isinstance(checkpoint, dict) or "edge_dim" not in checkpoint:
+            state_dict = checkpoint if isinstance(checkpoint, dict) else checkpoint
+            q_head_key = "q_head.0.weight"
+            if q_head_key in state_dict:
+                q_head_in = state_dict[q_head_key].shape[1]
+                hidden_dim = int(model_cfg.get("hidden_dim", 32))
+                checkpoint_edge_dim = q_head_in - hidden_dim * 2
+        validate_checkpoint_edge_dim(checkpoint_edge_dim, env_edge_dim, use_fleet_potential)
+
+        model.load_state_dict(
+            checkpoint if isinstance(checkpoint, dict) and "edge_dim" not in checkpoint else checkpoint
+        )
+        model.to(device)
+        model.eval()
+        policy_objects.update({"edgeq_model": model})
+
+    elif eval_config.policy == "mappo":
+        if not eval_config.model_path:
+            raise ValueError("eval.model_path is required for mappo policy")
+        on_policy_path = Path("baselines/on-policy").resolve()
+        if str(on_policy_path) not in sys.path:
+            sys.path.insert(0, str(on_policy_path))
+        from onpolicy.algorithms.r_mappo.algorithm.r_actor_critic import R_Actor
+        from gymnasium import spaces
+
+        neighbor_k = int(mappo_cfg.get("neighbor_k", 8))
+        actor_state = torch.load(eval_config.model_path, map_location=device)
+        obs_dim = _infer_mappo_obs_dim(actor_state)
+        if obs_dim is None:
+            edge_dim = int(get_edge_dim(eval_env_cfg))
+            obs_dim = 5 + neighbor_k * edge_dim + 4 + 16
+        mappo_edge_dim = _infer_edge_dim_from_obs_dim(int(obs_dim), neighbor_k)
+        if mappo_edge_dim is None:
+            mappo_edge_dim = int(get_edge_dim(eval_env_cfg))
+        act_dim = neighbor_k + 1
+
+        class MinimalArgs:
+            hidden_size = int(mappo_cfg.get("hidden_size", 64))
+            use_ReLU = True
+            use_recurrent_policy = True
+            recurrent_N = int(mappo_cfg.get("recurrent_N", 1))
+            use_naive_recurrent_policy = False
+            use_feature_normalization = False
+            layer_N = 1
+            use_orthogonal = True
+            gain = 0.01
+            use_policy_active_masks = True
+            stacked_frames = 1
+            algorithm_name = "mappo"
+
+        obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        act_space = spaces.Discrete(act_dim)
+        mappo_actor = R_Actor(MinimalArgs(), obs_space, act_space, device=device)
+        mappo_actor.load_state_dict(actor_state)
+        mappo_actor.to(device)
+        mappo_actor.eval()
+        policy_objects.update(
+            {
+                "mappo_actor": mappo_actor,
+                "mappo_edge_dim": mappo_edge_dim,
+                "mappo_hidden_size": MinimalArgs.hidden_size,
+                "mappo_recurrent_N": MinimalArgs.recurrent_N,
+            }
+        )
+
+    elif eval_config.policy == "cpo":
+        if not eval_config.model_path:
+            raise ValueError("eval.model_path is required for cpo policy")
+        import pickle
+        pytorch_cpo_path = Path("baselines/PyTorch-CPO").resolve()
+        if str(pytorch_cpo_path) not in sys.path:
+            sys.path.insert(0, str(pytorch_cpo_path))
+        from models.discrete_policy import DiscretePolicy  # noqa: F401
+
+        with open(eval_config.model_path, "rb") as f:
+            cpo_policy, _, cpo_running_state = pickle.load(f)
+        cpo_policy.to(device)
+        cpo_policy.eval()
+        if cpo_running_state is not None:
+            cpo_running_state.fix = True
+        cpo_obs_dim = _infer_cpo_obs_dim(cpo_policy)
+        cpo_edge_dim = None
+        if cpo_obs_dim is not None:
+            cpo_edge_dim = _infer_cpo_edge_dim_from_obs_dim(
+                int(cpo_obs_dim), int(cpo_cfg.get("neighbor_k", 8))
+            )
+        policy_objects.update(
+            {"cpo_policy": cpo_policy, "cpo_running_state": cpo_running_state, "cpo_edge_dim": cpo_edge_dim}
+        )
+
+    elif eval_config.policy == "student_mlp":
+        if not eval_config.model_path:
+            raise ValueError("eval.model_path is required for student_mlp policy")
+        checkpoint = torch.load(eval_config.model_path, map_location=device)
+        config = {}
+        if isinstance(checkpoint, dict):
+            config = dict(checkpoint.get("config", {}))
+            state_dict = checkpoint.get("state_dict", checkpoint)
+        else:
+            state_dict = checkpoint
+        input_dim = int(config.get("input_dim", 0))
+        if input_dim <= 0:
+            raise ValueError("student_mlp checkpoint missing input_dim in config")
+        student_model = StudentActionMLP(
+            input_dim=input_dim,
+            hidden_dim=int(config.get("hidden_dim", student_mlp_cfg.get("hidden_dim", 64))),
+            num_layers=int(config.get("num_layers", student_mlp_cfg.get("num_layers", 2))),
+            dropout=float(config.get("dropout", student_mlp_cfg.get("dropout", 0.1))),
+            use_layer_norm=bool(config.get("use_layer_norm", student_mlp_cfg.get("use_layer_norm", False))),
+        )
+        student_model.load_state_dict(state_dict)
+        student_model.to(device)
+        student_model.eval()
+        policy_objects.update({"student_mlp": student_model})
+
+    elif eval_config.policy == "mohito":
+        if not eval_config.model_path:
+            raise ValueError("eval.model_path is required for mohito policy")
+        from src.baselines.mohito_adapter import load_mohito_actor
+
+        mohito_actor = load_mohito_actor(eval_config.model_path, mohito_cfg, device)
+        policy_objects.update({"mohito_actor": mohito_actor})
+
+    elif eval_config.policy == "wu2024":
+        from src.baselines.wu2024_adapter import load_wu2024_model
+
+        wu2024_model, wu2024_weights_mode = load_wu2024_model(
+            eval_config.model_path, wu2024_cfg, device
+        )
+        policy_objects.update(
+            {"wu2024_model": wu2024_model, "wu2024_weights_mode": wu2024_weights_mode}
+        )
+
+    _EVAL_WORKER_CACHE[key] = policy_objects
+    return policy_objects
+
+
+def _evaluate_single_episode(
+    env_cfg_episode: Dict[str, Any],
+    eval_config: EvalConfig,
+    model_cfg: Dict[str, Any],
+    hcride_cfg: Dict[str, Any],
+    mappo_cfg: Dict[str, Any],
+    cpo_cfg: Dict[str, Any],
+    student_mlp_cfg: Dict[str, Any],
+    mohito_cfg: Dict[str, Any],
+    wu2024_cfg: Dict[str, Any],
+    policy_objects: Dict[str, Any],
+    device: torch.device,
+    episode_index: int,
+    show_step_bar: bool,
+) -> Dict[str, float]:
+    env = EventDrivenEnv(_build_env_config(env_cfg_episode))
+    start_time = float(getattr(env, "current_time", 0.0))
+    sim_time_limit = env_cfg_episode.get("max_sim_time_sec")
+    if sim_time_limit is not None:
+        sim_time_limit = float(sim_time_limit)
+    sim_time_epsilon = 0.5
+
+    total_tacc = 0.0
+    steps = 0
+    done = False
+    end_reason = "unknown"
+    rng = np.random.default_rng(int(eval_config.seed) + int(episode_index))
+
+    step_iter = None
+    if show_step_bar and eval_config.max_steps is not None and tqdm is not None:
+        step_iter = tqdm(
+            total=int(eval_config.max_steps),
+            desc=f"Eval ep {episode_index}",
+            unit="step",
+            dynamic_ncols=True,
+            leave=False,
+        )
+
+    mappo_rnn_states = None
+    mappo_masks = None
+    if eval_config.policy == "mappo":
+        hidden_size = int(policy_objects.get("mappo_hidden_size", 64))
+        recurrent_N = int(policy_objects.get("mappo_recurrent_N", 1))
+        mappo_rnn_states = np.zeros((1, recurrent_N, hidden_size), dtype=np.float32)
+        mappo_masks = np.ones((1, 1), dtype=np.float32)
+
+    while not done:
+        if eval_config.max_steps is not None and steps >= int(eval_config.max_steps):
+            end_reason = "max_steps"
+            break
+        if sim_time_limit is not None:
+            current_time = float(getattr(env, "current_time", 0.0))
+            elapsed = current_time - start_time
+            if elapsed >= sim_time_limit:
+                end_reason = "max_sim_time"
+                break
+        features = env.get_feature_batch()
+        if eval_config.policy == "random":
+            action = _random_policy(features, rng)
+        elif eval_config.policy == "greedy":
+            action = _greedy_policy(features)
+        elif eval_config.policy == "edgeq":
+            action = _edgeq_policy(features, policy_objects["edgeq_model"], device)
+        elif eval_config.policy == "hcride":
+            action = _hcride_policy(env, features, hcride_cfg)
+        elif eval_config.policy == "mappo":
+            action, mappo_rnn_states = _mappo_policy(
+                env,
+                features,
+                mappo_cfg,
+                policy_objects["mappo_actor"],
+                mappo_rnn_states,
+                mappo_masks,
+                device,
+                edge_dim=policy_objects.get("mappo_edge_dim"),
+            )
+        elif eval_config.policy == "cpo":
+            action = _cpo_policy(
+                env,
+                features,
+                cpo_cfg,
+                policy_objects["cpo_policy"],
+                policy_objects.get("cpo_running_state"),
+                device,
+                edge_dim_override=policy_objects.get("cpo_edge_dim"),
+            )
+        elif eval_config.policy == "student_mlp":
+            action = _student_mlp_policy(env, features, policy_objects["student_mlp"], device)
+        elif eval_config.policy == "mohito":
+            from src.baselines.mohito_adapter import mohito_policy
+
+            action = mohito_policy(
+                env, features, policy_objects["mohito_actor"], mohito_cfg, device
+            )
+        elif eval_config.policy == "wu2024":
+            from src.baselines.wu2024_adapter import wu2024_policy
+
+            action = wu2024_policy(
+                env, features, policy_objects["wu2024_model"], wu2024_cfg, device, rng
+            )
+        else:
+            raise ValueError(f"Unknown eval policy: {eval_config.policy}")
+
+        if action is None:
+            end_reason = "action_none"
+            break
+        _, _reward, done, info = env.step(int(action))
+        total_tacc += float(info.get("step_tacc_gain", 0.0))
+        steps += 1
+        if sim_time_limit is not None:
+            current_time = float(getattr(env, "current_time", 0.0))
+            elapsed = current_time - start_time
+            if elapsed > sim_time_limit + sim_time_epsilon and not done:
+                raise RuntimeError(
+                    f"Eval exceeded max_sim_time_sec={sim_time_limit:.3f} (elapsed={elapsed:.3f})"
+                )
+        if done and end_reason == "unknown":
+            end_reason = str(info.get("done_reason", "env_done"))
+        if step_iter is not None:
+            step_iter.update(1)
+
+    if step_iter is not None:
+        step_iter.close()
+    if done and end_reason == "unknown":
+        end_reason = "env_done"
+
+    metrics = _compute_metrics(env, total_tacc)
+    metrics["episode_index"] = float(episode_index)
+    metrics["seed"] = float(env_cfg_episode.get("seed", eval_config.seed + episode_index))
+    metrics["steps"] = float(steps)
+    end_time = float(getattr(env, "current_time", 0.0))
+    metrics["sim_time_sec"] = end_time
+    metrics["sim_time_elapsed_sec"] = max(0.0, end_time - start_time)
+    metrics["end_reason"] = end_reason
+    return metrics
+
+
+def _eval_worker(payload: Dict[str, Any]) -> Dict[str, float]:
+    eval_config = EvalConfig(**payload["eval_config"])
+    device = torch.device(eval_config.device)
+    policy_objects = _load_policy_objects(
+        payload["eval_env_cfg"],
+        eval_config,
+        payload["model_cfg"],
+        payload["mappo_cfg"],
+        payload["cpo_cfg"],
+        payload["student_mlp_cfg"],
+        payload["mohito_cfg"],
+        payload["wu2024_cfg"],
+        device,
+    )
+    return _evaluate_single_episode(
+        payload["env_cfg_episode"],
+        eval_config,
+        payload["model_cfg"],
+        payload["hcride_cfg"],
+        payload["mappo_cfg"],
+        payload["cpo_cfg"],
+        payload["student_mlp_cfg"],
+        payload["mohito_cfg"],
+        payload["wu2024_cfg"],
+        policy_objects,
+        device,
+        payload["episode_index"],
+        show_step_bar=False,
+    )
+
 def _random_policy(features: Dict[str, np.ndarray], rng: np.random.Generator) -> Optional[int]:
     actions = features["actions"].astype(np.int64)
     mask = features["action_mask"].astype(bool)
@@ -176,6 +574,7 @@ def _greedy_policy(features: Dict[str, np.ndarray]) -> Optional[int]:
     node_features = features["node_features"]
     action_nodes = features["action_node_indices"].astype(np.int64)
     edge_features = features["edge_features"]
+    edge_dim = int(edge_features.shape[1]) if edge_features.ndim == 2 else 4
     scores = []
     for idx in valid:
         node_idx = int(action_nodes[idx])
@@ -228,6 +627,30 @@ def _edgeq_policy(
     return int(actions[idx])
 
 
+def _student_mlp_policy(
+    env: EventDrivenEnv,
+    features: Dict[str, np.ndarray],
+    model: StudentActionMLP,
+    device: torch.device,
+) -> Optional[int]:
+    actions = features["actions"].astype(np.int64)
+    mask = features["action_mask"].astype(bool)
+    if len(actions) == 0:
+        return None
+    valid = np.where(mask)[0]
+    if len(valid) == 0:
+        return None
+    action_vectors, _feature_names = build_action_vectors(features, env)
+    if action_vectors.size == 0:
+        return None
+    with torch.no_grad():
+        logits = model(torch.tensor(action_vectors, dtype=torch.float32, device=device)).detach().cpu().numpy()
+    logits_masked = np.copy(logits)
+    logits_masked[~mask] = -1e9
+    idx = int(np.argmax(logits_masked))
+    return int(actions[idx])
+
+
 def _mappo_policy(
     env: EventDrivenEnv,
     features: Dict[str, np.ndarray],
@@ -236,6 +659,7 @@ def _mappo_policy(
     rnn_states: np.ndarray,
     masks: np.ndarray,
     device: torch.device,
+    edge_dim: Optional[int] = None,
 ) -> Tuple[Optional[int], np.ndarray]:
     """
     MAPPO actor policy for evaluation.
@@ -266,17 +690,21 @@ def _mappo_policy(
     # Build observation from features (flattened)
     node_features = features["node_features"]
     edge_features = features["edge_features"]
+    if edge_dim is None:
+        edge_dim = int(edge_features.shape[1]) if edge_features.ndim == 2 else 4
     current_idx = int(features["current_node_index"][0])
     
     # Current node features
     current_node_feat = node_features[current_idx]  # [5]
     
     # Edge features padded to neighbor_k
-    edge_feat_padded = np.zeros((neighbor_k, 4), dtype=np.float32)
+    edge_feat_padded = np.zeros((neighbor_k, edge_dim), dtype=np.float32)
     n_edges = min(len(edge_features), neighbor_k)
     if n_edges > 0:
-        edge_feat_padded[:n_edges] = edge_features[:n_edges]
-    edge_feat_flat = edge_feat_padded.flatten()  # [neighbor_k * 4]
+        feat_dim = int(edge_features.shape[1]) if edge_features.ndim == 2 else 0
+        if feat_dim > 0:
+            edge_feat_padded[:n_edges, : min(edge_dim, feat_dim)] = edge_features[:n_edges, : min(edge_dim, feat_dim)]
+    edge_feat_flat = edge_feat_padded.flatten()  # [neighbor_k * edge_dim]
     
     # Onboard summary
     vehicle = env._get_active_vehicle()
@@ -337,6 +765,7 @@ def _cpo_policy(
     policy: Any,
     running_state: Any,
     device: torch.device,
+    edge_dim_override: Optional[int] = None,
 ) -> Optional[int]:
     """
     CPO policy for evaluation (deterministic mode using argmax).
@@ -373,11 +802,17 @@ def _cpo_policy(
     else:
         current_node_feat = np.zeros(5, dtype=np.float32)
     
-    # Edge features padded to neighbor_k [neighbor_k * 4]
-    edge_feat_padded = np.zeros((neighbor_k, 4), dtype=np.float32)
+    if edge_dim_override is not None:
+        edge_dim = int(edge_dim_override)
+    else:
+        edge_dim = int(edge_features.shape[1]) if edge_features.ndim == 2 else 4
+    # Edge features padded to neighbor_k [neighbor_k * edge_dim]
+    edge_feat_padded = np.zeros((neighbor_k, edge_dim), dtype=np.float32)
     n_edges = min(len(edge_features), neighbor_k)
     if n_edges > 0:
-        edge_feat_padded[:n_edges] = edge_features[:n_edges]
+        feat_dim = int(edge_features.shape[1]) if edge_features.ndim == 2 else 0
+        if feat_dim > 0:
+            edge_feat_padded[:n_edges, : min(edge_dim, feat_dim)] = edge_features[:n_edges, : min(edge_dim, feat_dim)]
     edge_feat_flat = edge_feat_padded.flatten()
     
     # Onboard summary [4]
@@ -407,7 +842,16 @@ def _cpo_policy(
     
     # Apply running state normalization if available
     if running_state is not None:
-        obs = running_state(obs, update=False)
+        try:
+            rs_mean = getattr(running_state, "rs", None)
+            mean_shape = getattr(rs_mean, "mean", None)
+            mean_shape = getattr(mean_shape, "shape", None)
+            if mean_shape is not None and len(mean_shape) == 1 and mean_shape[0] != obs.shape[0]:
+                running_state = None
+            else:
+                obs = running_state(obs, update=False)
+        except Exception:
+            running_state = None
     
     # Build action mask (padded)
     action_dim = neighbor_k + 1  # +1 for NOOP
@@ -417,7 +861,7 @@ def _cpo_policy(
     action_mask_padded[-1] = True  # NOOP always valid
     
     # Forward pass
-    obs_t = torch.tensor(obs, dtype=torch.float64, device=device).unsqueeze(0)
+    obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
     with torch.no_grad():
         action_probs = policy(obs_t)  # [1, action_dim]
     
@@ -435,6 +879,55 @@ def _cpo_policy(
             return None
     
     return int(actions[action_idx])
+
+
+def _infer_mappo_obs_dim(state_dict: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(state_dict, dict):
+        return None
+    for key in ("base.mlp.fc1.0.weight", "base.mlp.fc1.weight"):
+        weight = state_dict.get(key)
+        if hasattr(weight, "shape") and len(weight.shape) == 2:
+            return int(weight.shape[1])
+    return None
+
+
+def _infer_edge_dim_from_obs_dim(obs_dim: int, neighbor_k: int) -> Optional[int]:
+    if neighbor_k <= 0:
+        return None
+    base_dim = 5 + 4 + 16  # node + onboard + pos_emb
+    edge_total = obs_dim - base_dim
+    if edge_total <= 0:
+        return None
+    if edge_total % neighbor_k != 0:
+        return None
+    edge_dim = int(edge_total / neighbor_k)
+    return edge_dim if edge_dim > 0 else None
+
+
+def _infer_cpo_obs_dim(policy: Any) -> Optional[int]:
+    weight = None
+    try:
+        layers = getattr(policy, "affine_layers", None)
+        if layers is not None and len(layers) > 0:
+            weight = getattr(layers[0], "weight", None)
+    except Exception:
+        weight = None
+    if hasattr(weight, "shape") and len(weight.shape) == 2:
+        return int(weight.shape[1])
+    return None
+
+
+def _infer_cpo_edge_dim_from_obs_dim(obs_dim: int, neighbor_k: int) -> Optional[int]:
+    if neighbor_k <= 0:
+        return None
+    base_dim = 5 + 4 + 1  # node + onboard + pos_emb
+    edge_total = obs_dim - base_dim
+    if edge_total <= 0:
+        return None
+    if edge_total % neighbor_k != 0:
+        return None
+    edge_dim = int(edge_total / neighbor_k)
+    return edge_dim if edge_dim > 0 else None
 
 
 def _hcride_policy(
@@ -528,6 +1021,7 @@ def _hcride_policy(
 def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
     return EnvConfig(
         max_horizon_steps=int(env_cfg.get("max_horizon_steps", 200)),
+        max_sim_time_sec=env_cfg.get("max_sim_time_sec"),
         mask_alpha=float(env_cfg.get("mask_alpha", 1.5)),
         walk_threshold_sec=int(env_cfg.get("walk_threshold_sec", 600)),
         max_requests=int(env_cfg.get("max_requests", 2000)),
@@ -557,6 +1051,7 @@ def _build_env_config(env_cfg: Dict[str, Any]) -> EnvConfig:
         reward_step_backlog_penalty=float(env_cfg.get("reward_step_backlog_penalty", 0.0)),
         reward_waiting_time_penalty_per_sec=float(env_cfg.get("reward_waiting_time_penalty_per_sec", 0.0)),
         demand_exhausted_min_time_sec=float(env_cfg.get("demand_exhausted_min_time_sec", 300.0)),
+        allow_demand_exhausted_termination=bool(env_cfg.get("allow_demand_exhausted_termination", True)),
         cvar_alpha=float(env_cfg.get("cvar_alpha", 0.95)),
         fairness_gamma=float(env_cfg.get("fairness_gamma", 1.0)),
         travel_time_multiplier=float(env_cfg.get("travel_time_multiplier", 1.0)),
@@ -587,6 +1082,7 @@ def evaluate(config: Dict[str, Any], config_path: str | Path, run_dir: Optional[
     hcride_cfg = eval_cfg.get("hcride", {})
     mappo_cfg = eval_cfg.get("mappo", {})
     cpo_cfg = eval_cfg.get("cpo", {})
+    student_mlp_cfg = eval_cfg.get("student_mlp", {})
     mohito_cfg = eval_cfg.get("mohito", {})
     wu2024_cfg = eval_cfg.get("wu2024", {})
 
@@ -597,7 +1093,17 @@ def evaluate(config: Dict[str, Any], config_path: str | Path, run_dir: Optional[
         model_path=eval_cfg.get("model_path"),
         device=str(eval_cfg.get("device", "cpu")),
         max_steps=eval_cfg.get("max_steps"),
+        parallel_episodes=int(eval_cfg.get("parallel_episodes", 1) or 1),
+        fast_eval_disable_debug=bool(eval_cfg.get("fast_eval_disable_debug", False)),
+        allow_cuda_parallel=bool(eval_cfg.get("allow_cuda_parallel", False)),
     )
+    env_overrides = dict(eval_cfg.get("env_overrides", {}))
+    eval_env_cfg = dict(env_cfg)
+    if env_overrides:
+        eval_env_cfg.update(env_overrides)
+    if eval_config.fast_eval_disable_debug:
+        eval_env_cfg["debug_mask"] = False
+        eval_env_cfg["debug_abort_on_alert"] = False
 
     if run_dir is None:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -605,187 +1111,87 @@ def evaluate(config: Dict[str, Any], config_path: str | Path, run_dir: Optional[
     run_dir.mkdir(parents=True, exist_ok=True)
 
     device = torch.device(eval_config.device)
-    model = None
-    if eval_config.policy == "edgeq":
-        if not eval_config.model_path:
-            raise ValueError("eval.model_path is required for edgeq policy")
-        # Dynamic import to avoid torch_geometric dependency when not needed
-        from src.models.edge_q_gnn import EdgeQGNN
-        
-        # Use unified edge_dim function
-        env_edge_dim = get_edge_dim(env_cfg)
-        use_fleet_potential = bool(env_cfg.get("use_fleet_potential", False))
-        
-        model = EdgeQGNN(
-            node_dim=int(model_cfg.get("node_dim", 5)),
-            edge_dim=env_edge_dim,
-            hidden_dim=int(model_cfg.get("hidden_dim", 32)),
-            num_layers=int(model_cfg.get("num_layers", 2)),
-            dropout=float(model_cfg.get("dropout", 0.0)),
-            dueling=bool(model_cfg.get("dueling", False)),
-        )
-        
-        # Load checkpoint and validate edge_dim compatibility
-        checkpoint = torch.load(eval_config.model_path, map_location=device)
-        checkpoint_edge_dim = checkpoint.get("edge_dim", 4) if isinstance(checkpoint, dict) and "edge_dim" in checkpoint else 4
-        
-        # If checkpoint is just state_dict, infer edge_dim from q_head layer
-        if not isinstance(checkpoint, dict) or "edge_dim" not in checkpoint:
-            # Try to infer from model weights
-            state_dict = checkpoint if isinstance(checkpoint, dict) else checkpoint
-            q_head_key = "q_head.0.weight"
-            if q_head_key in state_dict:
-                q_head_in = state_dict[q_head_key].shape[1]
-                # q_head input = hidden_dim * 2 + edge_dim
-                hidden_dim = int(model_cfg.get("hidden_dim", 32))
-                checkpoint_edge_dim = q_head_in - hidden_dim * 2
-        
-        # Validate compatibility
-        validate_checkpoint_edge_dim(checkpoint_edge_dim, env_edge_dim, use_fleet_potential)
-        
-        model.load_state_dict(checkpoint if isinstance(checkpoint, dict) and "edge_dim" not in checkpoint else checkpoint)
-        model.to(device)
-        model.eval()
-
-    # MAPPO actor loading
-    mappo_actor = None
-    mappo_rnn_states = None
-    mappo_masks = None
-    if eval_config.policy == "mappo":
-        if not eval_config.model_path:
-            raise ValueError("eval.model_path is required for mappo policy")
-        # Dynamically import on-policy modules
-        on_policy_path = Path("baselines/on-policy").resolve()
-        if str(on_policy_path) not in sys.path:
-            sys.path.insert(0, str(on_policy_path))
-        from onpolicy.algorithms.r_mappo.algorithm.r_actor_critic import R_Actor
-        from onpolicy.utils.util import get_shape_from_obs_space
-        import argparse
-        
-        # Build minimal args for R_Actor
-        neighbor_k = int(mappo_cfg.get("neighbor_k", 8))
-        obs_dim = 5 + neighbor_k * 4 + 4 + 16  # node + edge + onboard + pos_emb
-        act_dim = neighbor_k + 1
-        
-        class MinimalArgs:
-            hidden_size = int(mappo_cfg.get("hidden_size", 64))
-            use_recurrent_policy = True
-            recurrent_N = int(mappo_cfg.get("recurrent_N", 1))
-            use_naive_recurrent_policy = False
-            use_feature_normalization = False
-            layer_N = 1
-            use_orthogonal = True
-            gain = 0.01
-            use_policy_active_masks = True
-            stacked_frames = 1
-        
-        from gymnasium import spaces
-        obs_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
-        act_space = spaces.Discrete(act_dim)
-        
-        mappo_actor = R_Actor(MinimalArgs(), obs_space, act_space, device=device)
-        actor_state = torch.load(eval_config.model_path, map_location=device)
-        mappo_actor.load_state_dict(actor_state)
-        mappo_actor.to(device)
-        mappo_actor.eval()
-        
-        # Initialize RNN states and masks
-        mappo_rnn_states = np.zeros((1, MinimalArgs.recurrent_N, MinimalArgs.hidden_size), dtype=np.float32)
-        mappo_masks = np.ones((1, 1), dtype=np.float32)
-
-    # CPO policy loading
-    cpo_policy = None
-    cpo_running_state = None
-    if eval_config.policy == "cpo":
-        if not eval_config.model_path:
-            raise ValueError("eval.model_path is required for cpo policy")
-        import pickle
-        pytorch_cpo_path = Path("baselines/PyTorch-CPO").resolve()
-        if str(pytorch_cpo_path) not in sys.path:
-            sys.path.insert(0, str(pytorch_cpo_path))
-        from models.discrete_policy import DiscretePolicy
-        
-        # Load pickled model (policy, value, running_state)
-        with open(eval_config.model_path, "rb") as f:
-            cpo_policy, _, cpo_running_state = pickle.load(f)
-        cpo_policy.to(device)
-        cpo_policy.eval()
-        if cpo_running_state is not None:
-            cpo_running_state.fix = True  # Freeze running state for eval
-
-    # MOHITO actor loading (zero-shot baseline)
-    mohito_actor = None
-    if eval_config.policy == "mohito":
-        if not eval_config.model_path:
-            raise ValueError("eval.model_path is required for mohito policy")
-        from src.baselines.mohito_adapter import load_mohito_actor
-        mohito_actor = load_mohito_actor(eval_config.model_path, mohito_cfg, device)
-
-    # Wu2024 model loading (architecture placeholder baseline)
-    wu2024_model = None
-    wu2024_weights_mode = "random_init"
-    if eval_config.policy == "wu2024":
-        from src.baselines.wu2024_adapter import load_wu2024_model
-        wu2024_model, wu2024_weights_mode = load_wu2024_model(
-            eval_config.model_path, wu2024_cfg, device
-        )
+    policy_objects = _load_policy_objects(
+        eval_env_cfg,
+        eval_config,
+        model_cfg,
+        mappo_cfg,
+        cpo_cfg,
+        student_mlp_cfg,
+        mohito_cfg,
+        wu2024_cfg,
+        device,
+    )
 
     episode_rows: List[Dict[str, float]] = []
-    rng = np.random.default_rng(int(eval_config.seed))
+    use_parallel = eval_config.parallel_episodes > 1 and eval_config.episodes > 1
+    if use_parallel and device.type != "cpu" and not eval_config.allow_cuda_parallel:
+        LOG.warning(
+            "parallel_episodes=%s requested but device=%s; falling back to serial. Set eval.allow_cuda_parallel=true to override.",
+            eval_config.parallel_episodes,
+            device,
+        )
+        use_parallel = False
 
-    for ep in range(int(eval_config.episodes)):
-        env_seed = int(eval_config.seed) + ep
-        env_cfg_episode = dict(env_cfg)
-        env_cfg_episode["seed"] = env_seed
-        env = EventDrivenEnv(_build_env_config(env_cfg_episode))
-
-        total_tacc = 0.0
-        steps = 0
-        done = False
-        while not done:
-            if eval_config.max_steps is not None and steps >= int(eval_config.max_steps):
-                break
-            features = env.get_feature_batch()
-            if eval_config.policy == "random":
-                action = _random_policy(features, rng)
-            elif eval_config.policy == "greedy":
-                action = _greedy_policy(features)
-            elif eval_config.policy == "edgeq":
-                action = _edgeq_policy(features, model, device)
-            elif eval_config.policy == "hcride":
-                action = _hcride_policy(env, features, hcride_cfg)
-            elif eval_config.policy == "mappo":
-                action, mappo_rnn_states = _mappo_policy(
-                    env, features, mappo_cfg, mappo_actor, mappo_rnn_states, mappo_masks, device
+    if use_parallel:
+        payloads = []
+        for ep in range(int(eval_config.episodes)):
+            env_seed = int(eval_config.seed) + ep
+            env_cfg_episode = dict(eval_env_cfg)
+            env_cfg_episode["seed"] = env_seed
+            payloads.append(
+                {
+                    "episode_index": ep,
+                    "eval_config": eval_config.__dict__,
+                    "env_cfg_episode": env_cfg_episode,
+                    "eval_env_cfg": eval_env_cfg,
+                    "model_cfg": model_cfg,
+                    "hcride_cfg": hcride_cfg,
+                    "mappo_cfg": mappo_cfg,
+                    "cpo_cfg": cpo_cfg,
+                    "student_mlp_cfg": student_mlp_cfg,
+                    "mohito_cfg": mohito_cfg,
+                    "wu2024_cfg": wu2024_cfg,
+                }
+            )
+        ctx = mp.get_context("spawn")
+        with ctx.Pool(processes=int(eval_config.parallel_episodes)) as pool:
+            results_iter = pool.imap_unordered(_eval_worker, payloads)
+            if tqdm is not None:
+                results_iter = tqdm(
+                    results_iter,
+                    total=int(eval_config.episodes),
+                    desc="Eval",
+                    unit="ep",
+                    dynamic_ncols=True,
                 )
-            elif eval_config.policy == "cpo":
-                action = _cpo_policy(
-                    env, features, cpo_cfg, cpo_policy, cpo_running_state, device
-                )
-            elif eval_config.policy == "mohito":
-                from src.baselines.mohito_adapter import mohito_policy
-                action = mohito_policy(
-                    env, features, mohito_actor, mohito_cfg, device
-                )
-            elif eval_config.policy == "wu2024":
-                from src.baselines.wu2024_adapter import wu2024_policy
-                action = wu2024_policy(
-                    env, features, wu2024_model, wu2024_cfg, device, rng
-                )
-            else:
-                raise ValueError(f"Unknown eval policy: {eval_config.policy}")
-
-            if action is None:
-                break
-            _, _reward, done, info = env.step(int(action))
-            total_tacc += float(info.get("step_tacc_gain", 0.0))
-            steps += 1
-
-        metrics = _compute_metrics(env, total_tacc)
-        metrics["episode_index"] = float(ep)
-        metrics["seed"] = float(env_seed)
-        metrics["steps"] = float(steps)
-        episode_rows.append(metrics)
+            episode_rows = list(results_iter)
+        episode_rows.sort(key=lambda row: row.get("episode_index", 0))
+    else:
+        ep_range = range(int(eval_config.episodes))
+        ep_iter = tqdm(ep_range, desc="Eval", unit="ep", dynamic_ncols=True) if tqdm is not None else ep_range
+        for ep in ep_iter:
+            env_seed = int(eval_config.seed) + ep
+            env_cfg_episode = dict(eval_env_cfg)
+            env_cfg_episode["seed"] = env_seed
+            metrics = _evaluate_single_episode(
+                env_cfg_episode,
+                eval_config,
+                model_cfg,
+                hcride_cfg,
+                mappo_cfg,
+                cpo_cfg,
+                student_mlp_cfg,
+                mohito_cfg,
+                wu2024_cfg,
+                policy_objects,
+                device,
+                ep,
+                show_step_bar=True,
+            )
+            episode_rows.append(metrics)
+            if tqdm is not None and hasattr(ep_iter, "set_postfix"):
+                ep_iter.set_postfix(steps=int(metrics.get("steps", 0)), refresh=False)
 
     df = pd.DataFrame(episode_rows)
     aggregate = {
@@ -795,15 +1201,17 @@ def evaluate(config: Dict[str, Any], config_path: str | Path, run_dir: Optional[
     for col in df.columns:
         if col in {"episode_index", "seed"}:
             continue
+        if not np.issubdtype(df[col].dtype, np.number):
+            continue
         aggregate[f"{col}_mean"] = float(df[col].mean())
         aggregate[f"{col}_std"] = float(df[col].std(ddof=0))
 
-    graph_hashes, od_hashes = build_hashes(env_cfg)
+    graph_hashes, od_hashes = build_hashes(eval_env_cfg)
     meta = {
         "config_path": str(config_path),
         "config_sha256": sha256_file(str(config_path)),
         "eval_config": eval_config.__dict__,
-        "env_config": env_cfg,
+        "env_config": eval_env_cfg,
         "model_config": model_cfg,
         "hcride_config": hcride_cfg,
         "wu2024_config": wu2024_cfg,

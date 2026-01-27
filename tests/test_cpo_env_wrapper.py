@@ -80,19 +80,21 @@ class TestCPOEnvWrapperSpaces:
         )
         
         # Expected: node(5) + edge(neighbor_k*4) + onboard(4) + pos(1)
-        expected_obs_dim = 5 + neighbor_k * 4 + 4 + 1
+        edge_dim = 5 if mock_env_config.use_fleet_potential else 4
+        expected_obs_dim = 5 + neighbor_k * edge_dim + 4 + 1
         
         with patch.object(CPOEnvWrapper, '__init__', lambda self, cfg: None):
             wrapper = CPOEnvWrapper.__new__(CPOEnvWrapper)
             wrapper.neighbor_k = neighbor_k
             wrapper.node_feat_dim = 5
-            wrapper.edge_feat_dim = 4
+            wrapper.edge_feat_dim = edge_dim
             wrapper.onboard_dim = 4
             wrapper.pos_dim = 1
             wrapper.obs_dim = expected_obs_dim
         
         assert wrapper.obs_dim == expected_obs_dim
-        assert expected_obs_dim == 42  # 5 + 32 + 4 + 1
+        if edge_dim == 4:
+            assert expected_obs_dim == 42  # 5 + 32 + 4 + 1
     
     def test_action_space_dimension(self, mock_env_config):
         """Verify action space includes NOOP."""

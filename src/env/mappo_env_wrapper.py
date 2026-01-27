@@ -43,6 +43,7 @@ class MAPPOEnvConfig:
     neighbor_k: int = 8  # Fixed number of candidate actions per agent
     obs_include_global: bool = False  # Include global stats in local obs
     max_episode_steps: int = 200  # Maximum steps per episode
+    fast_inactive_obs: bool = True  # If True, compute full obs only for active agents
 
 
 def _normalize_features(arr: np.ndarray, eps: float = 1e-8) -> np.ndarray:
@@ -89,7 +90,7 @@ class MAPPOEnvWrapper:
         # Observation dimensions
         # Local obs: node features (5) + edge features (4) per action + position embedding
         self._node_feat_dim = 5
-        self._edge_feat_dim = 4
+        self._edge_feat_dim = 5 if self.env.config.use_fleet_potential else 4
         self._pos_emb_dim = 16  # Learned position embedding dimension
         self._global_summary_dim = 32  # Global state summary
         
@@ -284,26 +285,45 @@ class MAPPOEnvWrapper:
         obs = np.zeros((self.n_agents, self._local_obs_dim), dtype=np.float32)
         share_obs = np.zeros((self.n_agents, self._share_obs_dim), dtype=np.float32)
         
-        # Get features from environment
+        # Get features from environment ONCE (critical for performance)
         features = self.env.get_feature_batch()
         node_features = features["node_features"]  # [n_stops, 5]
-        
-        # Global summary
+
+        # Global summary (fixed dim)
         global_summary = self._compute_global_summary(node_features, features)
-        
+
+        # Precompute per-agent coarse state used in share_obs
+        # Shape: [n_agents, node_feat_dim + 2]
+        agent_state = np.zeros((self.n_agents, self._node_feat_dim + 2), dtype=np.float32)
         for agent_id in range(self.n_agents):
+            vehicle = self.env.vehicles[agent_id]
+            stop_idx = self.env.stop_index.get(vehicle.current_stop, 0)
+            if stop_idx < len(node_features):
+                agent_state[agent_id, : self._node_feat_dim] = node_features[stop_idx]
+            agent_state[agent_id, self._node_feat_dim] = float(len(vehicle.onboard)) / 10.0
+            agent_state[agent_id, self._node_feat_dim + 1] = max(
+                0.0, float(vehicle.available_time - self.env.current_time) / 600.0
+            )
+
+        # Determine which agents need full observation build
+        if self.config.fast_inactive_obs:
+            active_ids = np.where(self._active_agent_mask)[0].tolist()
+            if not active_ids:
+                active_ids = []
+        else:
+            active_ids = list(range(self.n_agents))
+
+        # Build local obs for chosen agents
+        for agent_id in active_ids:
             vehicle = self.env.vehicles[agent_id]
             local_obs = self._build_local_obs(vehicle, features)
             obs[agent_id] = local_obs
-            
-            # Shared obs = local + global + other agents
-            other_agents_obs = self._build_other_agents_obs(agent_id)
-            share_obs[agent_id] = np.concatenate([
-                local_obs,
-                global_summary,
-                other_agents_obs
-            ])
-            
+
+        # Build share_obs (local + global + other agents state)
+        other_agents_by_agent = self._build_other_agents_obs_all(agent_state)
+        for agent_id in range(self.n_agents):
+            share_obs[agent_id] = np.concatenate([obs[agent_id], global_summary, other_agents_by_agent[agent_id]])
+
         return obs, share_obs
     
     def _build_local_obs(self, vehicle, features: Dict[str, np.ndarray]) -> np.ndarray:
@@ -400,34 +420,22 @@ class MAPPOEnvWrapper:
         
         return summary
     
-    def _build_other_agents_obs(self, agent_id: int) -> np.ndarray:
-        """Build observation of other agents' states."""
+    def _build_other_agents_obs_all(self, agent_state: np.ndarray) -> np.ndarray:
+        """Build other-agent observation blocks for all agents.
+
+        This avoids O(n_agents^2) calls to env.get_feature_batch() which was
+        the dominant bottleneck for large fleets.
+        """
         other_dim = (self.n_agents - 1) * (self._node_feat_dim + 2)
-        other_obs = np.zeros(other_dim, dtype=np.float32)
-        
-        idx = 0
-        for other_id in range(self.n_agents):
-            if other_id == agent_id:
-                continue
-            vehicle = self.env.vehicles[other_id]
-            stop_idx = self.env.stop_index.get(vehicle.current_stop, 0)
-            
-            # Node features at other agent's position
-            node_feat = np.zeros(self._node_feat_dim, dtype=np.float32)
-            features = self.env.get_feature_batch()
-            if stop_idx < len(features["node_features"]):
-                node_feat = features["node_features"][stop_idx]
-            
-            # Agent-specific info
-            onboard_count = len(vehicle.onboard) / 10.0
-            available_time = (vehicle.available_time - self.env.current_time) / 600.0
-            
-            other_obs[idx:idx + self._node_feat_dim] = node_feat
-            other_obs[idx + self._node_feat_dim] = onboard_count
-            other_obs[idx + self._node_feat_dim + 1] = max(0, available_time)
-            
-            idx += self._node_feat_dim + 2
-            
+        other_obs = np.zeros((self.n_agents, other_dim), dtype=np.float32)
+        for agent_id in range(self.n_agents):
+            if agent_id == 0:
+                others = agent_state[1:]
+            elif agent_id == self.n_agents - 1:
+                others = agent_state[:-1]
+            else:
+                others = np.concatenate([agent_state[:agent_id], agent_state[agent_id + 1 :]], axis=0)
+            other_obs[agent_id] = others.reshape(-1)
         return other_obs
     
     def close(self) -> None:
