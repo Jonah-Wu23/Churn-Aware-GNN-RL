@@ -1,77 +1,81 @@
-# Community Micro-transit Dynamic Dispatching (GNN + RL)
+# Community Micro-Transit Dynamic Dispatching (GNN + RL)
 
-This repository provides a maintainable and auditable scaffold for a community micro-transit dynamic dispatching system using GNN + RL. The system targets a single primary metric: Total Avoided Private Car Travel Time (TACC).
+This repository is a public, minimal release of a community micro-transit dynamic dispatching system using GNN + RL. It targets a single primary metric: Total Avoided Private Car Travel Time (TACC), while modeling passenger churn and enforcing hard service constraints.
 
 ## Goals
 - Shift demand from private cars to micro-transit by reducing passenger churn
-- Provide a reproducible training and evaluation pipeline
+- Provide a reproducible training/evaluation pipeline
 - Separate algorithmic churn from structurally unserviceable demand
 
 ## Primary Metric
-- TACC (Total Avoided Private Car Travel Time): the total time that would have been spent by private cars for trips served by the system
+- **TACC (Total Avoided Private Car Travel Time)**: total private-car travel time avoided by served trips
 
-## Two-Stage Simulation
-- Stage 1: Event-driven Gym for high-frequency training
-- Stage 2: SUMO/TraCI for physical validation and sim-to-real checks
+## Simulation Stack
+- **Stage 1**: Event-driven Gym (fast training/eval)
+- **Stage 2**: SUMO/TraCI (physical validation; evaluation only)
 
 ## Three-Layer Graph
-- Layer 0: Raw OSM data for physical simulation
-- Layer 1: Routing graph for travel time computation
-- Layer 2: Logical dispatch graph with stop-only nodes for GNN
+- **Layer 0**: OSM stop features
+- **Layer 1**: Drive graph for travel-time computation
+- **Layer 2**: Logical dispatch graph (stop-only nodes for GNN)
 
 ## Compliance and Audit
 - Strict stop-based service: no curbside pickup
 - OD requests must map to legal stops
 - Structural unreachability is reported separately and excluded from algorithmic churn
-- All data/graph generation must emit JSON audit reports under `reports/audit/`
+- Graph/OD audit reports are generated under `reports/audit/` during runs
 
 ## Reproducibility
-- Fixed random seeds
-- All runs log config, code version, and metrics
+- Fixed random seeds and run metadata
+- Deterministic evaluation with explicit config overrides
 - Outputs include audit reports, metrics, and run metadata
 
-## NYC Study Area
-- NYC experiments use the configured study-area bbox (see `configs/manhattan.yaml`) rather than the full city
-
 ## Current Status (Code-Accurate)
-- Event-driven Gym simulator with multi-vehicle support, hard mask budgets, churn game, CVaR risk, fairness weight.
-- Three-layer graph build with audit JSON + SVG visualization, zero-travel-time fix, and optional zero-in/out pruning.
-- Node2Vec embeddings via local `node2vec/` clone (`scripts/train_node2vec.py`).
-- Edge-Q ECC model in pure PyTorch; k-hop subgraph batching supported in the env.
-- Training runner is still a baseline/diagnostic loop; DQNTrainer exists in `src/train/dqn.py` but is not wired into the CLI yet.
-- Curriculum learning, evaluator, and baselines remain pending (see `todos.md`).
+- Event-driven Gym simulator with multi-vehicle support, hard mask budgets, churn game, CVaR risk, and fairness weighting
+- Graph build with audit JSON + SVG, zero-travel-time fixes, and optional zero-in/out pruning
+- Edge-Q GNN (PyG TransformerConv) with k-hop subgraph batching
+- Curriculum training (L0–L3), evaluator, and baseline adapters (MAPPO/CPO/MOHITO/WU2024)
+- Distillation pipeline (student MLP) and sensitivity/ablation evaluation scripts
+
+## Data and Artifacts
+This public release does **not** include raw/processed data or run outputs.  
+All data artifacts and reports are generated locally under `data/` and `reports/` when you run scripts.
+
+## Quickstart
+```bash
+# Map OD to legal stops
+python scripts/map_od.py --config configs/manhattan.yaml
+
+# Build logical graph
+python scripts/build_graph.py --config configs/manhattan.yaml
+
+# Audit graph (JSON + SVG)
+python scripts/audit_graph.py --config configs/manhattan.yaml
+
+# Train Node2Vec embeddings (requires external node2vec + gensim)
+python scripts/train_node2vec.py --config configs/manhattan.yaml
+
+# Train EdgeQ with curriculum
+python scripts/run_curriculum_train.py --config configs/manhattan_curriculum_v13.yaml
+
+# Evaluate baselines
+python scripts/run_eval.py --config configs/manhattan_curriculum_v13.yaml --policy edgeq
+```
+
+Notes:
+- Node2Vec requires a local `node2vec` implementation and `gensim`.
+- Audit outputs are written under `reports/audit/`.
 
 ## Testing
-Core tests are isolated from baseline dependencies. The `baselines/` directory is excluded from pytest discovery via `pytest.ini`.
+Core tests are isolated from baseline dependencies via `pytest.ini`.
 
 ```bash
-# Recommended: run all core tests
 pytest -q tests
-
-# Verbose output for debugging
 pytest -v tests
 ```
 
-See `AGENTS.md` for more testing options and baseline setup notes.
-
-## Quickstart (current)
-- Filter NYC trips by bbox (optional): `python scripts/filter_taxi_bbox.py --config configs/manhattan.yaml`
-- Map OD to legal stops: `python scripts/map_od.py --config configs/manhattan.yaml`
-- Build logical graph: `python scripts/build_graph.py --config configs/manhattan.yaml`
-- Audit graph (JSON + SVG): `python scripts/audit_graph.py --config configs/manhattan.yaml`
-- Train Node2Vec embeddings: `python scripts/train_node2vec.py --config configs/manhattan.yaml`
-- Run Gym baseline/diagnostic: `python scripts/run_gym_train.py --config configs/manhattan.yaml`
-- Validate in SUMO (skeleton): `python scripts/run_sumo_eval.py --config configs/manhattan.yaml`
-- Download Chicago taxi data: `python scripts/download_chicago_taxi.py --start 2025-05-01T00:00:00 --end 2025-05-31T23:45:00 --output data/external/Chicago_5_data.csv`
-
-Notes:
-- Node2Vec requires a local `node2vec/` clone and `gensim`. On Windows, use `workers=1`.
-- Audit outputs are written under `reports/audit/`.
-
-See `docs/architecture.md`, `docs/requirements.md`, and `todos.md` for details.
-
-## Realtime visualization (EdgeQ)
-Enable realtime publishing in your training config:
+## Realtime Visualization (EdgeQ)
+Enable publishing in your training config:
 
 ```yaml
 train:
@@ -95,7 +99,7 @@ train:
       epsilon_floor: 0.2
 ```
 
-Run the dashboard in a separate process:
+Run the dashboard:
 
 ```bash
 python scripts/run_realtime_viz.py --config configs/manhattan.yaml --port 8050
