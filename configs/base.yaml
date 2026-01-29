@@ -1,0 +1,85 @@
+project:
+  name: microtransit-gnn-rl
+  seed: 42
+
+graph:
+  place_name: "Manhattan, New York, USA"
+  cutoff_sec: 900
+  neighbor_k: 20
+  min_travel_time_sec: 1.0
+  prune_zero_in: false
+  prune_zero_out: false
+
+mapping:
+  euclidean_knn: 10
+  walk_threshold_sec: 600
+  soft_assignment_delta_sec: 30
+
+mask:
+  alpha: 1.5
+
+risk:
+  cvar_alpha: 0.95
+  fairness_gamma: 0.1
+
+eval:
+  episodes: 5
+  seed: 7
+  policy: random
+  device: cuda
+  max_steps: null
+
+curriculum:
+  stages: [L0, L1, L2, L3]
+  trigger_rho: 0.8
+  gamma: 1.0
+  stage_max_steps: 50000
+  stage_min_episodes: 3
+  stage_params:
+    L0:
+      sample_fraction: 0.1
+      time_scale: 2.0
+      churn_tol_override_sec: 1000000000
+    L1:
+      density_multiplier: 1.2
+      time_scale: 0.6
+      center_quantile: 0.3
+      short_trip_quantile: 0.3
+    L2:
+      density_multiplier: 1.2
+      time_scale: 0.7
+      center_ratio: 0.8
+      center_quantile: 0.3
+      short_trip_quantile: 0.3
+      edge_quantile: 0.7
+      long_trip_quantile: 0.7
+    L3:
+      density_multiplier: 1.0
+      time_scale: 1.0
+
+paths:
+  data_dir: data
+  processed_graph_dir: data/processed/graph
+  reports_dir: reports
+  graph_nodes_path: data/processed/graph/layer2_nodes.parquet
+  graph_edges_path: data/processed/graph/layer2_edges.parquet
+  graph_audit_path: reports/audit/graph_build.json
+  graph_viz_path: reports/audit/graph_build.svg
+
+embeddings:
+  method: node2vec
+  dimensions: 32
+  walk_length: 40
+  num_walks: 200
+  p: 1.0
+  q: 1.0
+  window: 10
+  min_count: 1
+  batch_words: 4
+  workers: 1
+  seed: 7
+  weight_mode: inverse_travel_time
+  graph_nodes_path: data/processed/graph/layer2_nodes.parquet
+  graph_edges_path: data/processed/graph/layer2_edges.parquet
+  output_path: data/processed/graph/node2vec_embeddings.parquet
+  audit_path: reports/audit/node2vec_embeddings.json

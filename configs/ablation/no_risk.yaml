@@ -1,0 +1,453 @@
+ablation:
+  type: no_risk
+  description: "平均值优化，禁用 CVaR 和公平性"
+
+graph:
+  place_name: "Manhattan, New York, USA"
+  bbox:
+    north: 40.77034
+    south: 40.74271
+    west: -73.99532
+    east: -73.91722
+  cutoff_sec: 1200
+  neighbor_k: 30
+  min_travel_time_sec: 1.0
+  prune_zero_in: true
+  prune_zero_out: true
+
+paths:
+  processed_graph_dir: "data/processed/graph"
+  graph_nodes_path: "data/processed/graph/layer2_nodes.parquet"
+  graph_edges_path: "data/processed/graph/layer2_edges.parquet"
+  od_input_glob: "data/processed/nyc_bbox/*.parquet"
+  od_output_dir: "data/processed/od_mapped"
+  graph_audit_path: "reports/audit/graph_build.json"
+  graph_viz_path: "reports/audit/graph_build.svg"
+  od_audit_path: "reports/audit/od_mapping.json"
+  graph_embeddings_path: "data/processed/graph/node2vec_embeddings.parquet"
+  embeddings_audit_path: "reports/audit/node2vec_embeddings.json"
+
+mapping:
+  euclidean_knn: 12
+  walk_threshold_sec: 600
+
+env:
+  max_horizon_steps: 6000
+  mask_alpha: 3.0
+  # Avoid action-space collapse when an onboard passenger is already late under the best possible route.
+  hard_mask_skip_unrecoverable: true
+  hard_mask_slack_sec: 0.0
+  walk_threshold_sec: 600
+  max_requests: 1500
+  seed: 7
+  num_vehicles: 51
+  vehicle_capacity: 6
+  request_timeout_sec: 600
+  debug_mask: true
+  churn_tol_sec: 300
+  churn_beta: 0.02
+  waiting_churn_tol_sec: 300
+  waiting_churn_beta: 0.01
+  onboard_churn_tol_sec: 300
+  onboard_churn_beta: 0.01
+  reward_service: 3.0
+  reward_waiting_churn_penalty: 0.3
+  reward_onboard_churn_penalty: 0.5
+  reward_travel_cost_per_sec: 0.0
+  reward_tacc_weight: 0.01
+  reward_onboard_delay_weight: 0.1
+  reward_cvar_penalty: 0.0
+  reward_fairness_weight: 0.0
+  reward_congestion_penalty: 0.0
+  demand_exhausted_min_time_sec: 300.0
+  reward_scale: 50.0
+  reward_step_backlog_penalty: 0.005
+  reward_waiting_time_penalty_per_sec: 0.00005
+  reward_potential_alpha: 0.0
+  reward_potential_lost_weight: 0.0
+  reward_potential_scale_with_reward_scale: true
+  debug_abort_on_alert: true
+  debug_dump_dir: "reports/debug/potential_alerts"
+  cvar_alpha: 0.95
+  fairness_gamma: 1.0
+  od_glob: "data/processed/od_mapped/*.parquet"
+  graph_nodes_path: "data/processed/graph/layer2_nodes.parquet"
+  graph_edges_path: "data/processed/graph/layer2_edges.parquet"
+  graph_embeddings_path: "data/processed/graph/node2vec_embeddings.parquet"
+  # Time-based train/eval split: "train" uses first 30%, "eval" uses remaining 70%
+  time_split_mode: "eval"   # Set to "train" or "eval" to enable split
+  time_split_ratio: 0.3
+
+  # Fleet-Aware Edge Potential (FAEP) - default disabled for backward compatibility
+  use_fleet_potential: true
+  fleet_potential_mode: "hybrid"  # Options: "next_stop", "k_hop", "hybrid"
+  fleet_potential_k: 1               # Only used when mode="k_hop"
+  fleet_potential_hybrid_center_weight: 0.5
+  fleet_potential_hybrid_neighbor_weight: 0.5
+  fleet_potential_phi: "log1p_norm"  # Options: "log1p_norm", "linear_norm"
+
+train:
+  seed: 7
+  total_steps: 200000
+  buffer_size: 100000
+  batch_size: 128
+  learning_starts: 10000
+  train_freq: 4
+  gradient_steps: 1
+  target_update_interval: 2000
+  target_update_tau: 0.005
+  gamma: 0.99
+  learning_rate: 0.0005
+  max_grad_norm: 10.0
+  double_dqn: true
+  epsilon_start: 1.0
+  epsilon_end: 0.15
+  epsilon_decay_steps: 500000
+  prioritized_replay: true
+  replay_alpha: 0.6
+  replay_beta_start: 0.4
+  replay_beta_frames: 200000
+  replay_eps: 0.000001
+  log_every_steps: 500
+  checkpoint_every_steps: 10000
+  device: cuda
+  use_amp: true
+  viz:
+    enabled: true
+    zmq_url: "tcp://0.0.0.0:6008"
+    publish_every_steps: 5
+    publish_on_episode_end: true
+    bind: true
+    alerts:
+      enabled: true
+      debug_abort_on_alert: true
+      abort_codes:
+        - active_stop_mismatch
+        - time_feature_mismatch
+        - overload_deadlock
+      debug_dump_dir: "reports/debug/potential_alerts"
+      alert_buffer_size: 50
+      no_service_positive_reward_epsilon: 0.1
+      entropy_warning_floor: 0.1
+      entropy_warning_patience: 50
+
+model:
+  node_dim: 5
+  edge_dim: 4
+  hidden_dim: 256
+  num_layers: 3
+  dropout: 0.1
+  dueling: true
+
+eval:
+  episodes: 5
+  seed: 7
+  policy: random
+  device: cuda
+  max_steps: null
+  parallel_episodes: 5
+  fast_eval_disable_debug: true
+  allow_cuda_parallel: true
+  env_overrides:
+    max_sim_time_sec: 900
+    max_horizon_steps: 999999
+    max_requests: 800
+    num_vehicles: 100
+    demand_exhausted_min_time_sec: 900
+    allow_demand_exhausted_termination: false
+    churn_tol_sec: 900
+    waiting_churn_tol_sec: 900
+    onboard_churn_tol_sec: 900
+  # HCRide baseline config
+  hcride:
+    alpha: 1.5
+    lagrange_lambda: 1.0
+    preference_threshold: 0.1
+    preference_radius_scale_m: 1000.0
+    empty_stop_penalty: 1000000.0
+  # MAPPO baseline config
+  mappo:
+    neighbor_k: 8
+    hidden_size: 64
+    recurrent_N: 1
+  # CPO baseline config
+  cpo:
+    neighbor_k: 8
+  # MOHITO baseline config (zero-shot, epsilon=0)
+  mohito:
+    feature_len: 5
+    num_layers_actor: 20
+    hidden_dim: 50
+    heads: 2
+    lr_actor: 0.001
+    beta: 0.001
+    grid_size: 10
+    epsilon: 0.0  # Fixed at 0 for deterministic eval
+
+embeddings:
+  method: node2vec
+  dimensions: 32
+  walk_length: 40
+  num_walks: 200
+  p: 1.0
+  q: 1.0
+  window: 10
+  min_count: 1
+  batch_words: 4
+  workers: 1
+  seed: 7
+  weight_mode: inverse_travel_time
+  graph_nodes_path: "data/processed/graph/layer2_nodes.parquet"
+  graph_edges_path: "data/processed/graph/layer2_edges.parquet"
+  output_path: "data/processed/graph/node2vec_embeddings.parquet"
+  audit_path: "reports/audit/node2vec_embeddings.json"
+
+sumo:
+  sumo_cfg_path: ""
+  sumo_binary: "sumo"
+  sumo_gui: false
+  sumo_port: 8813
+  sumo_seed: 7
+  sumo_step_length: 1.0
+  sumo_start_time: 0.0
+  sumo_end_time: 36000.0
+  sumo_warmup_steps: 100
+  stop_to_sumo_edge_path: "data/processed/graph/stop_to_sumo_edge.json"
+
+curriculum:
+  stages: [L0, L1, L2, L3]
+  strict_stage_params: true  # Fail-fast mode for unrecognized stage_params fields
+  trigger_service_rate: 0.4
+  gamma: 1.0
+  stage_max_steps: 50000
+  stage_steps:
+    L0: 10000
+  stage_min_episodes: 3
+  
+  # Rho-gated transition settings
+  service_rate_window_size: 5
+  require_service_rate_transition: true
+  service_rate_gate_source: "auto"
+  stage_service_rate_gate_source:
+    L2: "train"
+  stage_require_service_rate:
+    L0: false
+  stage_extension_steps: 30000
+  max_stage_extensions: 2
+  fail_policy: "fail_fast"
+  service_rate_warning_threshold: 0.28  # 70% of trigger_service_rate
+  
+  # Collapse protection
+  collapse_drop_delta: 0.10
+  collapse_min_rho: 0.15
+  collapse_patience: 2
+  epsilon_cap_on_collapse: 0.3
+  cap_steps: 5000
+  lr_mult_on_collapse: 0.5
+  
+  # Evaluation settings
+  eval_enabled: true
+  eval_seeds: [42, 123, 456, 789, 1000]
+  eval_interval_steps: 5000
+  
+  # Reward ramp settings
+  reward_ramp_steps: 10000
+  ramp_fields:
+    - reward_service
+    - reward_waiting_churn_penalty
+    - reward_onboard_churn_penalty
+    - reward_fairness_weight
+    - reward_cvar_penalty
+    - reward_terminal_backlog_penalty
+    - reward_congestion_penalty
+  
+  epsilon_by_stage:
+    L0:
+      start: 0.3
+      end: 0.1
+      decay_steps: 50000
+    L1:
+      start: 0.2
+      end: 0.05
+      decay_steps: 50000
+    L2:
+      start: 1.0
+      end: 0.05
+      decay_steps: 80000
+    L3:
+      start: 0.5
+      end: 0.3
+      decay_steps: 80000
+  
+  l3_two_stage:
+    enabled: true
+    phase1_steps: 20000
+    phase2_steps: 15000
+    behavior_cloning:
+      enabled: true
+      steps: 5000
+      log_every: 500
+      teacher_congestion_weight: 0.5
+      teacher_coverage_weight: 0.3
+    phase1_env_overrides:
+      reward_waiting_churn_penalty: 1.0
+      reward_terminal_backlog_penalty: 10.0
+      reward_scale: 30.0
+      reward_service_transform: "log1p"
+      reward_service_transform_scale: 60.0
+      reward_tacc_transform: "log1p"
+      reward_tacc_transform_scale: 60.0
+      reward_step_backlog_penalty: 0.003
+      reward_waiting_time_penalty_per_sec: 0.00003
+      reward_congestion_penalty: 0.05
+      reward_onboard_delay_weight: 0.1
+      reward_potential_alpha: 0.3
+      reward_potential_lost_weight: 1.0
+      reward_potential_scale_with_reward_scale: false
+    phase2_env_overrides:
+      reward_waiting_churn_penalty: 1.0
+      reward_terminal_backlog_penalty: 10.0
+      reward_scale: 30.0
+      reward_service_transform: "log1p"
+      reward_service_transform_scale: 60.0
+      reward_tacc_transform: "log1p"
+      reward_tacc_transform_scale: 60.0
+      reward_step_backlog_penalty: 0.003
+      reward_waiting_time_penalty_per_sec: 0.00009
+      reward_congestion_penalty: 0.075
+      reward_onboard_delay_weight: 0.3
+      reward_potential_alpha: 0.175
+      reward_potential_lost_weight: 1.0
+      reward_potential_scale_with_reward_scale: false
+    # Phase3 explicitly inherits from phase2 (never empty!)
+    phase3_env_overrides:
+      reward_waiting_churn_penalty: 1.0
+      reward_terminal_backlog_penalty: 10.0
+      reward_scale: 30.0
+      reward_service_transform: "log1p"
+      reward_service_transform_scale: 60.0
+      reward_tacc_transform: "log1p"
+      reward_tacc_transform_scale: 60.0
+      reward_step_backlog_penalty: 0.003
+      reward_waiting_time_penalty_per_sec: 0.00015
+      reward_congestion_penalty: 0.10
+      reward_onboard_delay_weight: 0.5
+      reward_potential_alpha: 0.05
+      reward_potential_lost_weight: 1.0
+      reward_potential_scale_with_reward_scale: false
+
+  stage_params:
+    L0:
+      sample_fraction: 0.1
+      time_scale: 2.0
+      churn_tol_override_sec: 1000000000
+      env_overrides:
+        reward_congestion_penalty: 0.0
+        reward_step_backlog_penalty: 0.0
+        reward_waiting_time_penalty_per_sec: 0.0
+    L1:
+      density_multiplier: 1.2
+      time_scale: 0.8
+      center_quantile: 0.3
+      short_trip_quantile: 0.3
+      churn_tol_override_sec: 1200
+      env_overrides:
+        allow_stop_when_actions_exist: false
+        reward_waiting_churn_penalty: 1.0
+        reward_terminal_backlog_penalty: 10.0
+        reward_scale: 30.0
+        reward_service_transform: "log1p"
+        reward_service_transform_scale: 60.0
+        reward_tacc_transform: "log1p"
+        reward_tacc_transform_scale: 60.0
+        reward_step_backlog_penalty: 0.003
+        reward_waiting_time_penalty_per_sec: 0.00003
+        reward_congestion_penalty: 0.05
+        reward_potential_alpha: 0.3
+        reward_potential_lost_weight: 1.0
+        reward_potential_scale_with_reward_scale: false
+        debug_abort_on_alert: true
+        debug_dump_dir: "reports/debug/potential_alerts"
+        max_horizon_steps: 6000
+        max_sim_time_sec: 3600.0
+    L2:
+      density_multiplier: 0.5
+      time_scale: 0.8
+      center_ratio: 0.8
+      center_quantile: 0.3
+      short_trip_quantile: 0.3
+      edge_quantile: 0.7
+      long_trip_quantile: 0.7
+      churn_tol_override_sec: 1200
+      env_overrides:
+        allow_stop_when_actions_exist: false
+        num_vehicles: 100
+        reward_waiting_churn_penalty: 1.0
+        reward_terminal_backlog_penalty: 10.0
+        reward_scale: 30.0
+        reward_service_transform: "log1p"
+        reward_service_transform_scale: 60.0
+        reward_tacc_transform: "log1p"
+        reward_tacc_transform_scale: 60.0
+        reward_step_backlog_penalty: 0.003
+        reward_waiting_time_penalty_per_sec: 0.00003
+        reward_congestion_penalty: 0.10
+        reward_onboard_delay_weight: 0.5
+        reward_waiting_time_penalty_per_sec: 0.00015
+        reward_potential_alpha: 0.05
+        reward_potential_lost_weight: 1.0
+        reward_potential_scale_with_reward_scale: false
+        debug_abort_on_alert: true
+        debug_dump_dir: "reports/debug/potential_alerts"
+        max_horizon_steps: 6000
+        max_sim_time_sec: 3600.0
+    L3:
+      density_multiplier: 1.0
+      time_scale: 1.0
+      churn_tol_override_sec: 900
+      env_overrides:
+        reward_congestion_penalty: 0.20
+        num_vehicles: 100
+
+# MOHITO in-domain training config (L2 unified protocol)
+mohito_train:
+  total_steps: 200000
+  num_vehicles: 100
+  graph_mode: "compact"
+  update_every_steps: 64
+  use_amp: true
+  amp_dtype: "fp16"
+  learning_rate: 0.001
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 5.0
+  eval_every_steps: 10000
+  # Network architecture (same as eval config)
+  feature_len: 5
+  num_layers_actor: 20
+  hidden_dim: 50
+  heads: 2
+  grid_size: 10
+
+# Wu2024 in-domain training config (L2 unified protocol)
+wu2024_train:
+  total_steps: 200000
+  num_vehicles: 100
+  learning_rate: 0.0005
+  entropy_coef: 0.01
+  value_loss_coef: 0.5
+  max_grad_norm: 5.0
+  eval_every_steps: 10000
+  # Network architecture
+  kmax: 32
+  hidden_size: 128
+  num_layers: 1
+  dropout: 0.1
+
+# MAPPO in-domain training config
+mappo_train:
+  num_vehicles: 100
+
+# CPO in-domain training config
+cpo_train:
+  num_vehicles: 100
