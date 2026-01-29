@@ -33,7 +33,7 @@ This repository is a public, minimal release of a community micro-transit dynami
 ## What Include
 - Event-driven Gym simulator with multi-vehicle support, hard mask budgets, churn game, CVaR risk, and fairness weighting
 - Graph build with audit JSON + SVG, zero-travel-time fixes, and optional zero-in/out pruning
-- Edge-Q GNN (PyG TransformerConv) with k-hop subgraph batching
+- Mobi-Churn GNN-DQN (PyG TransformerConv) with k-hop subgraph batching
 - Curriculum training (L0–L3), evaluator, and baseline adapters (MAPPO/CPO/MOHITO/WU2024)
 - Distillation pipeline (student MLP) and sensitivity/ablation evaluation scripts
 
@@ -55,7 +55,7 @@ python scripts/audit_graph.py --config configs/manhattan.yaml
 # Train Node2Vec embeddings (requires external node2vec + gensim)
 python scripts/train_node2vec.py --config configs/manhattan.yaml
 
-# Train EdgeQ with curriculum
+# Train Mobi-Churn GNN-DQN with curriculum
 python scripts/run_curriculum_train.py --config configs/manhattan_curriculum_v13.yaml
 
 # Evaluate baselines
@@ -74,7 +74,7 @@ pytest -q tests
 pytest -v tests
 ```
 
-## Realtime Visualization (EdgeQ)
+## Realtime Visualization (Mobi-Churn GNN-DQN)
 Enable publishing in your training config:
 
 ```yaml
