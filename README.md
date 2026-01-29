@@ -30,7 +30,7 @@ This repository is a public, minimal release of a community micro-transit dynami
 - Deterministic evaluation with explicit config overrides
 - Outputs include audit reports, metrics, and run metadata
 
-## Current Status (Code-Accurate)
+## What Include
 - Event-driven Gym simulator with multi-vehicle support, hard mask budgets, churn game, CVaR risk, and fairness weighting
 - Graph build with audit JSON + SVG, zero-travel-time fixes, and optional zero-in/out pruning
 - Edge-Q GNN (PyG TransformerConv) with k-hop subgraph batching
